@@ -80,6 +80,10 @@ const (
 // ----------------------------------------------------------------------------
 
 // MoClawProvider implements the Provider interface for moclaw.ai.
+//
+// Each configured Key (account) gets its own isolated authState so that
+// multiple moclaw.ai accounts can be used concurrently without token
+// cross-contamination or rotation races.
 type MoClawProvider struct {
 	logger              schemas.Logger
 	httpClient          *fasthttp.Client
@@ -87,7 +91,15 @@ type MoClawProvider struct {
 	sendBackRawRequest  bool
 	sendBackRawResponse bool
 
-	auth *authState
+	// Per-key auth state. Keyed by the Key's unique identifier so every
+	// configured account gets its own refresh/access-token lifecycle and
+	// its own on-disk rotation cache.
+	authsMu  sync.Mutex
+	auths    map[string]*authState
+
+	// Shared Auth0 config (same for all keys on this provider instance).
+	auth0ClientID string
+	auth0URL      string
 }
 
 // NewMoClawProvider constructs a MoClawProvider.
@@ -116,15 +128,10 @@ func NewMoClawProvider(config *schemas.ProviderConfig, logger schemas.Logger) (*
 	}
 	config.NetworkConfig.BaseURL = strings.TrimRight(config.NetworkConfig.BaseURL, "/")
 
-	auth := &authState{
-		clientID:   defaultAuth0ClientID,
-		auth0URL:   defaultAuth0Domain + "/oauth/token",
-		httpClient: httpClient,
-		logger:     logger,
-		cachePath:  resolveRefreshTokenCachePath(),
-	}
+	// Resolve Auth0 config (can be overridden via ExtraHeaders).
+	auth0ClientID := defaultAuth0ClientID
 	if v, ok := config.NetworkConfig.ExtraHeaders["X-MoClaw-Auth0-ClientId"]; ok && v != "" {
-		auth.clientID = v
+		auth0ClientID = v
 	}
 
 	return &MoClawProvider{
@@ -133,13 +140,17 @@ func NewMoClawProvider(config *schemas.ProviderConfig, logger schemas.Logger) (*
 		networkConfig:       config.NetworkConfig,
 		sendBackRawRequest:  config.SendBackRawRequest,
 		sendBackRawResponse: config.SendBackRawResponse,
-		auth:                auth,
+		auths:               make(map[string]*authState),
+		auth0ClientID:       auth0ClientID,
+		auth0URL:            defaultAuth0Domain + "/oauth/token",
 	}, nil
 }
 
-// resolveRefreshTokenCachePath returns the path where rotated refresh tokens
-// are persisted. Honors $BIFROST_DATA_DIR if set; falls back to "./".
-func resolveRefreshTokenCachePath() string {
+// resolveRefreshTokenCachePathForKey returns the path where rotated refresh
+// tokens are persisted for a specific key. Files are namespaced per keyID to
+// prevent cross-contamination between multiple moclaw.ai accounts.
+// Honors $BIFROST_DATA_DIR if set; falls back to ~/.bifrost/.
+func resolveRefreshTokenCachePathForKey(keyID string) string {
 	dir := os.Getenv("BIFROST_DATA_DIR")
 	if dir == "" {
 		if home, err := os.UserHomeDir(); err == nil {
@@ -147,15 +158,50 @@ func resolveRefreshTokenCachePath() string {
 		}
 	}
 	if dir == "" {
-		return refreshTokenCacheFile
+		dir = "."
 	}
 	_ = os.MkdirAll(dir, 0700)
-	return filepath.Join(dir, refreshTokenCacheFile)
+	// Sanitize keyID so it is safe to use as a filename component.
+	safe := strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			return r
+		}
+		return '_'
+	}, keyID)
+	if safe == "" {
+		safe = "default"
+	}
+	return filepath.Join(dir, "moclaw_refresh_"+safe+".txt")
 }
 
 // GetProviderKey returns the provider identifier.
 func (p *MoClawProvider) GetProviderKey() schemas.ModelProvider {
 	return schemas.MoClaw
+}
+
+// getOrCreateAuth returns the authState for the given key, creating it lazily
+// on first use. Each key gets its own isolated authState with its own on-disk
+// rotation cache, so multiple moclaw.ai accounts can run concurrently without
+// token cross-contamination or rotation races.
+func (p *MoClawProvider) getOrCreateAuth(key schemas.Key) *authState {
+	keyID := key.ID
+	if keyID == "" {
+		keyID = "default"
+	}
+	p.authsMu.Lock()
+	defer p.authsMu.Unlock()
+	if a, ok := p.auths[keyID]; ok {
+		return a
+	}
+	a := &authState{
+		clientID:   p.auth0ClientID,
+		auth0URL:   p.auth0URL,
+		httpClient: p.httpClient,
+		logger:     p.logger,
+		cachePath:  resolveRefreshTokenCachePathForKey(keyID),
+	}
+	p.auths[keyID] = a
+	return a
 }
 
 // ----------------------------------------------------------------------------
@@ -494,7 +540,8 @@ func flattenContent(c *schemas.ChatMessageContent) string {
 //	query_done                               → finish_reason="stop", emit [DONE]
 func (p *MoClawProvider) ChatCompletionStream(ctx *schemas.BifrostContext, postHookRunner schemas.PostHookRunner, postHookSpanFinalizer func(context.Context), key schemas.Key, request *schemas.BifrostChatRequest) (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
 	// 1. Resolve access_token (refresh if needed).
-	accessToken, err := p.auth.getAccessToken(ctx, key.Value.GetValue())
+	auth := p.getOrCreateAuth(key)
+	accessToken, err := auth.getAccessToken(ctx, key.Value.GetValue())
 	if err != nil {
 		return nil, providerUtils.NewBifrostOperationError("moclaw: auth refresh failed", err)
 	}
@@ -548,7 +595,7 @@ func (p *MoClawProvider) ChatCompletionStream(ctx *schemas.BifrostContext, postH
 		}
 		// On 401, drop access_token so next call forces a refresh.
 		if status == http.StatusUnauthorized {
-			p.auth.invalidateAccessToken()
+			auth.invalidateAccessToken()
 		}
 		msg := fmt.Sprintf("moclaw: ws dial failed status=%d body=%q url_token_len=%d", status, body, len(accessToken))
 		return nil, providerUtils.NewBifrostOperationError(msg, dialErr)
@@ -639,7 +686,7 @@ func (p *MoClawProvider) ChatCompletionStream(ctx *schemas.BifrostContext, postH
 			// Auth result frame is informational; first frame after dial.
 			if rx.Type == "auth_result" {
 				if rx.Success != nil && !*rx.Success {
-					p.auth.invalidateAccessToken()
+					auth.invalidateAccessToken()
 					ctx.SetValue(schemas.BifrostContextKeyStreamEndIndicator, true)
 					providerUtils.ProcessAndSendBifrostError(ctx, postHookRunner, &schemas.BifrostError{
 						IsBifrostError: false,
