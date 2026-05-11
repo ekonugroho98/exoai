@@ -146,24 +146,39 @@ export default function AddMoClawAccountsDialog({ open, onClose }: Props) {
 	}
 
 	// ── Manual login ──────────────────────────────────────────────────────────
-	function parseManualLines() {
+	// Parse lines of format "email:token" or just "token"
+	function parseManualLines(): Array<{ name: string; token: string }> {
 		return manualText
 			.split("\n")
 			.map((l) => l.trim())
-			.filter(Boolean);
+			.filter(Boolean)
+			.map((line, i) => {
+				// Detect "email:token" — token part starts with eyJ (JWT) or v1.
+				const colonIdx = line.indexOf(":");
+				if (colonIdx > 0) {
+					const possibleEmail = line.slice(0, colonIdx).trim();
+					const possibleToken = line.slice(colonIdx + 1).trim();
+					// Only treat as email:token if token looks like a real token
+					if (possibleToken.startsWith("eyJ") || possibleToken.startsWith("v1.")) {
+						return { name: possibleEmail || `moclaw-account-${i + 1}`, token: possibleToken };
+					}
+				}
+				// Plain token — auto name
+				return { name: `moclaw-account-${i + 1}`, token: line };
+			});
 	}
 
 	async function handleManual() {
-		const lines = parseManualLines();
-		if (!lines.length) return;
+		const entries = parseManualLines();
+		if (!entries.length) return;
 		setIsManualSubmitting(true);
 		let ok = 0;
-		for (let i = 0; i < lines.length; i++) {
+		for (const entry of entries) {
 			try {
-				await createKey(`moclaw-account-${i + 1}`, lines[i]);
+				await createKey(entry.name, entry.token);
 				ok++;
 			} catch (err) {
-				toast.error(`Line ${i + 1} failed`, { description: getErrorMessage(err) });
+				toast.error(`"${entry.name}" failed`, { description: getErrorMessage(err) });
 			}
 		}
 		setIsManualSubmitting(false);
@@ -180,7 +195,8 @@ export default function AddMoClawAccountsDialog({ open, onClose }: Props) {
 		return <Loader2 className="h-5 w-5 animate-spin text-primary" />;
 	}
 
-	const manualLineCount = parseManualLines().length;
+	const manualEntries = parseManualLines();
+	const manualLineCount = manualEntries.length;
 
 	return (
 		<Dialog
@@ -289,18 +305,29 @@ export default function AddMoClawAccountsDialog({ open, onClose }: Props) {
 				{step === "manual" && (
 					<div className="flex flex-col gap-3 py-2">
 						<label className="text-sm font-medium">
-							Tokens{" "}
-							<span className="text-muted-foreground font-normal">(one per line)</span>
+							Refresh Tokens{" "}
+							<span className="text-muted-foreground font-normal">(one per line — email:token optional)</span>
 						</label>
 						<Textarea
-							placeholder={"eyJhbGci...   ← access_token (24h)\nv1.MTI...    ← refresh_token (30d)"}
+							placeholder={"v1.MTI4NjQ...                  ← refresh_token (preferred)\nuser@gmail.com:v1.NjI4MA...   ← with email label"}
 							rows={6}
 							value={manualText}
 							onChange={(e) => setManualText(e.target.value)}
 							className="font-mono text-xs"
 							autoFocus
 						/>
-						<p className="text-muted-foreground text-xs">{manualLineCount} key{manualLineCount !== 1 ? "s" : ""}</p>
+						{manualLineCount > 0 && (
+							<div className="text-muted-foreground text-xs space-y-0.5">
+								{manualEntries.map((e, i) => (
+									<div key={i} className="flex gap-2">
+										<span className="font-mono">{i + 1}.</span>
+										<span className="font-medium text-foreground/80">{e.name}</span>
+										<span className="font-mono opacity-50">{e.token.slice(0, 12)}...</span>
+									</div>
+								))}
+							</div>
+						)}
+						{manualLineCount === 0 && <p className="text-muted-foreground text-xs">0 keys</p>}
 					</div>
 				)}
 
