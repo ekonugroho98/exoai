@@ -161,7 +161,17 @@ async def do_login(page) -> None:
         await page.wait_for_url("*moclaw.ai*", timeout=30000)
     except Exception:
         pass  # May already be there or may have a different URL pattern
-    await page.wait_for_timeout(3000)
+    await page.wait_for_timeout(2000)
+
+    # Handle "Free Trial" modal — appears for new accounts, can be slow to load.
+    try:
+        btn = page.locator("button:has-text('Start Free Trial')").first
+        await btn.wait_for(state="visible", timeout=15000)
+        prog("Clicking Start Free Trial...")
+        await btn.click()
+        await page.wait_for_timeout(1500)
+    except Exception:
+        pass  # Not present — account already has a plan
 
     # Extract tokens
     prog("Extracting tokens from localStorage...")
