@@ -173,6 +173,16 @@ async def do_login(page) -> None:
     except Exception:
         pass  # Not present — account already has a plan
 
+    # Handle "Trial started!" confirmation modal → click "Get started" to dismiss.
+    try:
+        btn = page.locator("button:has-text('Get started')").first
+        if await btn.is_visible(timeout=5000):
+            prog("Trial started! Clicking Get started...")
+            await btn.click()
+            await page.wait_for_timeout(1000)
+    except Exception:
+        pass
+
     # Extract tokens
     prog("Extracting tokens from localStorage...")
     tokens = await poll_tokens(page)
