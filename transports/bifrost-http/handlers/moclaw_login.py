@@ -144,6 +144,17 @@ async def do_login(page) -> None:
     except Exception:
         pass  # Not present — normal for existing/personal accounts
 
+    # Handle Google OAuth consent screen ("Sign in to auth0.com" → Continue).
+    # Appears on first-time authorization for new accounts.
+    try:
+        btn = page.locator("button:has-text('Continue')").first
+        if await btn.is_visible(timeout=3000):
+            prog("Clicking Continue on Google consent screen...")
+            await btn.click()
+            await page.wait_for_timeout(1000)
+    except Exception:
+        pass  # Not present — already authorized before
+
     # Wait for redirect back to moclaw.ai
     prog("Waiting for redirect to moclaw.ai...")
     try:
