@@ -103,19 +103,36 @@ async def fill_google_credentials(login_page) -> bool:
         await login_page.wait_for_selector('input[type="email"]', timeout=15000)
         await login_page.fill('input[type="email"]', EMAIL)
         await login_page.keyboard.press("Enter")
+        # Wait for page to transition to password screen
+        await login_page.wait_for_timeout(2500)
+        try:
+            await login_page.wait_for_load_state("domcontentloaded", timeout=8000)
+        except Exception:
+            pass
     except Exception as e:
         err(f"Email input not found: {e}")
         return False
 
-    # Password
+    # Password — skip Google's hidden decoy field (aria-hidden="true")
+    # Try multiple selectors in case Google changes their markup
     prog("Entering Google password...")
-    try:
-        await login_page.wait_for_selector('input[type="password"]', timeout=15000)
-        await login_page.wait_for_timeout(500)
-        await login_page.fill('input[type="password"]', PASSWORD)
-        await login_page.keyboard.press("Enter")
-    except Exception as e:
-        err(f"Password field not found (2FA required? wrong credentials?): {e}")
+    pwd_filled = False
+    for pwd_sel in [
+        'input[type="password"]:not([aria-hidden="true"])',
+        'input[type="password"][aria-hidden="false"]',
+        'input[name="Passwd"]',
+        'input[name="password"]',
+    ]:
+        try:
+            await login_page.wait_for_selector(pwd_sel, state="visible", timeout=8000)
+            await login_page.fill(pwd_sel, PASSWORD)
+            await login_page.keyboard.press("Enter")
+            pwd_filled = True
+            break
+        except Exception:
+            continue
+    if not pwd_filled:
+        err("Password field not found — check credentials or 2FA requirement")
         return False
 
     return True
@@ -151,74 +168,66 @@ async def do_login(page) -> None:
     # ── Click "Continue with Google" — may open popup or redirect in-page ────
     prog("Clicking Continue with Google...")
 
-    login_page = page  # default: same-page flow
-    popup_detected = False
+    for selector in _GOOGLE_SELECTORS:
+        try:
+            await page.locator(selector).first.click(timeout=4000)
+            break
+        except Exception:
+            continue
 
-    try:
-        # Listen for a popup BEFORE clicking so we don't miss it
-        async with page.expect_popup(timeout=8000) as popup_info:
-            for selector in _GOOGLE_SELECTORS:
-                try:
-                    await page.locator(selector).first.click(timeout=3000)
-                    break
-                except Exception:
-                    continue
-        popup = await popup_info.value
-        await popup.wait_for_load_state("domcontentloaded")
-        login_page = popup
-        popup_detected = True
-        prog("Google login opened in popup window")
-    except Exception:
-        # No popup within timeout — Google redirected in the same tab
-        if not popup_detected:
-            for selector in _GOOGLE_SELECTORS:
-                try:
-                    if await page.locator(selector).first.is_visible(timeout=2000):
-                        await page.locator(selector).first.click()
-                        break
-                except Exception:
-                    continue
-        login_page = page
+    # Wait a moment, then find whichever page/popup ended up on accounts.google.com
+    await page.wait_for_timeout(3000)
+    login_page = page
+    for p in page.context.pages:
+        try:
+            if "accounts.google" in p.url or "google.com/o/oauth2" in p.url:
+                await p.wait_for_load_state("domcontentloaded", timeout=5000)
+                login_page = p
+                prog(f"Google login page found: {p.url[:60]}")
+                break
+        except Exception:
+            continue
+    if login_page is page:
         prog("Google login in same tab")
 
     # ── Fill credentials in the correct page context ──────────────────────────
     if not await fill_google_credentials(login_page):
         return
 
-    # After password submit the popup may navigate to interstitial/consent pages.
-    # Wait for any ongoing navigation to settle before looking for buttons.
-    try:
-        await login_page.wait_for_load_state("domcontentloaded", timeout=10000)
-    except Exception:
-        pass
-    await login_page.wait_for_timeout(1000)
+    # ── Handle all Google interstitials in a polling loop ────────────────────
+    # After password submit, Google may show multiple pages before redirecting:
+    # "I understand" → "Continue (consent)" → final redirect to moclaw.ai.
+    # We poll until we leave accounts.google.com or timeout.
+    prog("Handling Google post-login screens...")
+    deadline = asyncio.get_event_loop().time() + 40  # max 40s
+    understand_sel = ", ".join(f"button:has-text('{t}')" for t in _UNDERSTAND_TEXTS)
+    continue_sel   = ", ".join(f"button:has-text('{t}')" for t in _CONTINUE_TEXTS)
+    while asyncio.get_event_loop().time() < deadline:
+        try:
+            current_url = login_page.url
+        except Exception:
+            break  # popup closed / navigated away
+        if "accounts.google" not in current_url and "google.com" not in current_url:
+            break  # left Google — done
 
-    # ── Handle "I understand" interstitial (Workspace new accounts) ───────────
-    try:
-        selector = ", ".join(f"button:has-text('{t}')" for t in _UNDERSTAND_TEXTS)
-        btn = login_page.locator(selector).first
-        if await btn.is_visible(timeout=4000):
-            prog("Clicking 'I understand'...")
-            await btn.click()
-            await login_page.wait_for_timeout(1000)
+        clicked = False
+        for sel, label in [
+            (understand_sel, "I understand"),
+            (continue_sel,   "Continue"),
+        ]:
             try:
-                await login_page.wait_for_load_state("domcontentloaded", timeout=8000)
+                btn = login_page.locator(sel).first
+                if await btn.is_visible(timeout=800):
+                    prog(f"Clicking '{label}'...")
+                    await btn.click()
+                    await login_page.wait_for_timeout(1200)
+                    clicked = True
+                    break
             except Exception:
                 pass
-    except Exception:
-        pass
 
-    # ── Handle "Continue/Lanjutkan" OAuth consent screen (auth0.com) ──────────
-    # This appears AFTER password submission in the popup — give it more time.
-    try:
-        selector = ", ".join(f"button:has-text('{t}')" for t in _CONTINUE_TEXTS)
-        btn = login_page.locator(selector).first
-        await btn.wait_for(state="visible", timeout=12000)
-        prog("Clicking Continue on Google consent screen...")
-        await btn.click()
-        await login_page.wait_for_timeout(1000)
-    except Exception:
-        pass
+        if not clicked:
+            await asyncio.sleep(1)
 
     # ── Wait for moclaw.ai to load (main page may redirect while popup closes)
     prog("Waiting for moclaw.ai to load...")
