@@ -185,25 +185,38 @@ async def do_login(page) -> None:
     if not await fill_google_credentials(login_page):
         return
 
+    # After password submit the popup may navigate to interstitial/consent pages.
+    # Wait for any ongoing navigation to settle before looking for buttons.
+    try:
+        await login_page.wait_for_load_state("domcontentloaded", timeout=10000)
+    except Exception:
+        pass
+    await login_page.wait_for_timeout(1000)
+
     # ── Handle "I understand" interstitial (Workspace new accounts) ───────────
     try:
         selector = ", ".join(f"button:has-text('{t}')" for t in _UNDERSTAND_TEXTS)
         btn = login_page.locator(selector).first
-        if await btn.is_visible(timeout=3000):
+        if await btn.is_visible(timeout=4000):
             prog("Clicking 'I understand'...")
             await btn.click()
             await login_page.wait_for_timeout(1000)
+            try:
+                await login_page.wait_for_load_state("domcontentloaded", timeout=8000)
+            except Exception:
+                pass
     except Exception:
         pass
 
-    # ── Handle "Continue/Lanjutkan" OAuth consent screen ─────────────────────
+    # ── Handle "Continue/Lanjutkan" OAuth consent screen (auth0.com) ──────────
+    # This appears AFTER password submission in the popup — give it more time.
     try:
         selector = ", ".join(f"button:has-text('{t}')" for t in _CONTINUE_TEXTS)
         btn = login_page.locator(selector).first
-        if await btn.is_visible(timeout=4000):
-            prog("Clicking Continue on Google consent screen...")
-            await btn.click()
-            await login_page.wait_for_timeout(1000)
+        await btn.wait_for(state="visible", timeout=12000)
+        prog("Clicking Continue on Google consent screen...")
+        await btn.click()
+        await login_page.wait_for_timeout(1000)
     except Exception:
         pass
 
