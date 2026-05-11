@@ -140,6 +140,14 @@ async def fill_google_credentials(login_page) -> bool:
 
 
 async def do_login(page) -> None:
+    # Clear all cookies + storage so every session starts fresh and Auth0
+    # always issues a new refresh_token with offline_access scope.
+    await page.context.clear_cookies()
+    try:
+        await page.context.clear_permissions()
+    except Exception:
+        pass
+
     prog("Navigating to moclaw.ai...")
     await page.goto("https://moclaw.ai/", timeout=30000, wait_until="domcontentloaded")
     await page.wait_for_timeout(2500)
