@@ -341,6 +341,13 @@ export const providersApi = baseApi.injectEndpoints({
 			}),
 		}),
 
+		moclawBrowserLoginStart: builder.mutation<{ session_id: string }, void>({
+			query: () => ({
+				url: '/providers/moclaw/browser-login',
+				method: 'POST',
+			}),
+		}),
+
 		getModelParameters: builder.query<ModelDatasheetResponse, string>({
 			queryFn: async (model, _queryApi, _extraOptions, baseQuery) => {
 				const result = await baseQuery(`/models/parameters?model=${encodeURIComponent(model)}`);
@@ -381,4 +388,5 @@ export const {
 	useGetModelParametersQuery,
 	useLazyGetModelParametersQuery,
 	useMoclawLoginMutation,
+	useMoclawBrowserLoginStartMutation,
 } = providersApi;

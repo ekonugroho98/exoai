@@ -10,13 +10,26 @@ import {
 } from "@/components/ui/dialog";
 import { Textarea } from "@/components/ui/textarea";
 import { getErrorMessage } from "@/lib/store";
-import { useCreateProviderKeyMutation, useMoclawLoginMutation } from "@/lib/store/apis/providersApi";
-import { KeyIcon, MonitorSmartphone } from "lucide-react";
-import { useState } from "react";
+import {
+	useCreateProviderKeyMutation,
+	useMoclawBrowserLoginStartMutation,
+	useMoclawLoginMutation,
+} from "@/lib/store/apis/providersApi";
+import { CheckCircle2, KeyIcon, Loader2, MonitorSmartphone, XCircle } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { v4 as uuid } from "uuid";
 
-type Step = "choose" | "auto" | "manual";
+type Step = "choose" | "browser" | "manual";
+
+interface BrowserLoginStatus {
+	status: "launching" | "connecting" | "navigating" | "waiting" | "done" | "error";
+	message?: string;
+	access_token?: string;
+	refresh_token?: string;
+	expires_in?: number;
+	error?: string;
+}
 
 interface Props {
 	open: boolean;
@@ -25,34 +38,41 @@ interface Props {
 
 export default function AddMoClawAccountsDialog({ open, onClose }: Props) {
 	const [step, setStep] = useState<Step>("choose");
-	const [inputText, setInputText] = useState("");
-	const [isSubmitting, setIsSubmitting] = useState(false);
-	const [moclawLogin] = useMoclawLoginMutation();
+
+	// ── Manual state ──────────────────────────────────────────────────────────
+	const [manualText, setManualText] = useState("");
+	const [isManualSubmitting, setIsManualSubmitting] = useState(false);
+
+	// ── Browser-login state ───────────────────────────────────────────────────
+	const [browserStatus, setBrowserStatus] = useState<BrowserLoginStatus | null>(null);
+	const [isBrowserRunning, setIsBrowserRunning] = useState(false);
+	const evtSourceRef = useRef<EventSource | null>(null);
+
+	// ── API hooks ─────────────────────────────────────────────────────────────
+	const [startBrowserLogin] = useMoclawBrowserLoginStartMutation();
 	const [createProviderKey] = useCreateProviderKeyMutation();
 
-	function reset() {
-		setStep("choose");
-		setInputText("");
-		setIsSubmitting(false);
-	}
+	// ── Cleanup on unmount or dialog close ───────────────────────────────────
+	const stopEventSource = useCallback(() => {
+		if (evtSourceRef.current) {
+			evtSourceRef.current.close();
+			evtSourceRef.current = null;
+		}
+	}, []);
 
-	function handleClose() {
-		reset();
-		onClose();
-	}
+	useEffect(() => {
+		if (!open) {
+			stopEventSource();
+			setStep("choose");
+			setManualText("");
+			setBrowserStatus(null);
+			setIsBrowserRunning(false);
+		}
+		return () => stopEventSource();
+	}, [open, stopEventSource]);
 
-	// Parse non-empty lines from the textarea
-	function parseLines(): string[] {
-		return inputText
-			.split("\n")
-			.map((l) => l.trim())
-			.filter(Boolean);
-	}
-
-	const lineCount = parseLines().length;
-
-	// Create a Bifrost key from a raw token value
-	async function createKey(name: string, tokenValue: string): Promise<void> {
+	// ── Helpers ───────────────────────────────────────────────────────────────
+	async function createKey(name: string, tokenValue: string) {
 		await createProviderKey({
 			provider: "moclaw",
 			key: {
@@ -67,98 +87,119 @@ export default function AddMoClawAccountsDialog({ open, onClose }: Props) {
 		}).unwrap();
 	}
 
-	async function handleAutoLogin() {
-		const lines = parseLines();
-		if (lines.length === 0) return;
+	// ── Browser login ─────────────────────────────────────────────────────────
+	async function handleBrowserLogin() {
+		setIsBrowserRunning(true);
+		setBrowserStatus({ status: "launching", message: "Starting browser..." });
 
-		setIsSubmitting(true);
-		let successCount = 0;
-		const errors: string[] = [];
+		let sessionId: string;
+		try {
+			const res = await startBrowserLogin().unwrap();
+			sessionId = res.session_id;
+		} catch (err) {
+			setBrowserStatus({ status: "error", error: getErrorMessage(err) });
+			setIsBrowserRunning(false);
+			return;
+		}
 
-		for (const line of lines) {
-			const sepIdx = line.indexOf(":");
-			if (sepIdx === -1) {
-				errors.push(`"${line}" — invalid format (expected email:password)`);
-				continue;
-			}
-			const email = line.slice(0, sepIdx).trim();
-			const password = line.slice(sepIdx + 1).trim();
-			if (!email || !password) {
-				errors.push(`"${line}" — email or password is empty`);
-				continue;
-			}
+		// Connect to SSE stream
+		const es = new EventSource(`/api/providers/moclaw/browser-login/${sessionId}`);
+		evtSourceRef.current = es;
+
+		es.addEventListener("status", async (e) => {
 			try {
-				const result = await moclawLogin({ email, password }).unwrap();
-				const tokenValue = result.refresh_token || result.access_token;
-				await createKey(email, tokenValue);
-				successCount++;
-			} catch (err) {
-				errors.push(`${email}: ${getErrorMessage(err)}`);
-			}
-		}
+				const evt: BrowserLoginStatus = JSON.parse((e as MessageEvent).data);
+				setBrowserStatus(evt);
 
-		setIsSubmitting(false);
+				if (evt.status === "done") {
+					es.close();
+					evtSourceRef.current = null;
+					const token = evt.refresh_token || evt.access_token || "";
+					if (token) {
+						try {
+							await createKey(`moclaw-${Date.now()}`, token);
+							toast.success("Account added successfully");
+							setIsBrowserRunning(false);
+							setBrowserStatus(null);
+							// Stay on browser step so user can add more accounts
+						} catch (err) {
+							setBrowserStatus({ status: "error", error: `Key save failed: ${getErrorMessage(err)}` });
+						}
+					}
+					setIsBrowserRunning(false);
+				} else if (evt.status === "error") {
+					es.close();
+					evtSourceRef.current = null;
+					setIsBrowserRunning(false);
+				}
+			} catch {}
+		});
 
-		if (successCount > 0) {
-			toast.success(`${successCount} account${successCount > 1 ? "s" : ""} added successfully`);
-		}
-		if (errors.length > 0) {
-			for (const e of errors) {
-				toast.error("Failed to add account", { description: e });
+		es.onerror = () => {
+			es.close();
+			evtSourceRef.current = null;
+			if (isBrowserRunning) {
+				setBrowserStatus({ status: "error", error: "Connection to server lost" });
+				setIsBrowserRunning(false);
 			}
-		}
-		if (successCount > 0) {
-			handleClose();
-		}
+		};
+	}
+
+	// ── Manual login ──────────────────────────────────────────────────────────
+	function parseManualLines() {
+		return manualText
+			.split("\n")
+			.map((l) => l.trim())
+			.filter(Boolean);
 	}
 
 	async function handleManual() {
-		const lines = parseLines();
-		if (lines.length === 0) return;
-
-		setIsSubmitting(true);
-		let successCount = 0;
-		const errors: string[] = [];
-
+		const lines = parseManualLines();
+		if (!lines.length) return;
+		setIsManualSubmitting(true);
+		let ok = 0;
 		for (let i = 0; i < lines.length; i++) {
-			const token = lines[i].trim();
-			const name = `moclaw-account-${i + 1}`;
 			try {
-				await createKey(name, token);
-				successCount++;
+				await createKey(`moclaw-account-${i + 1}`, lines[i]);
+				ok++;
 			} catch (err) {
-				errors.push(`Line ${i + 1}: ${getErrorMessage(err)}`);
+				toast.error(`Line ${i + 1} failed`, { description: getErrorMessage(err) });
 			}
 		}
-
-		setIsSubmitting(false);
-
-		if (successCount > 0) {
-			toast.success(`${successCount} account${successCount > 1 ? "s" : ""} added successfully`);
-		}
-		if (errors.length > 0) {
-			for (const e of errors) {
-				toast.error("Failed to add key", { description: e });
-			}
-		}
-		if (successCount > 0) {
-			handleClose();
+		setIsManualSubmitting(false);
+		if (ok > 0) {
+			toast.success(`${ok} account${ok > 1 ? "s" : ""} added`);
+			onClose();
 		}
 	}
+
+	// ── Status icon helper ────────────────────────────────────────────────────
+	function StatusIcon({ status }: { status: BrowserLoginStatus["status"] }) {
+		if (status === "done") return <CheckCircle2 className="h-5 w-5 text-green-500" />;
+		if (status === "error") return <XCircle className="h-5 w-5 text-destructive" />;
+		return <Loader2 className="h-5 w-5 animate-spin text-primary" />;
+	}
+
+	const manualLineCount = parseManualLines().length;
 
 	return (
 		<Dialog
 			open={open}
 			onOpenChange={(o) => {
-				if (!o) handleClose();
+				if (!o && !isBrowserRunning) onClose();
 			}}
 		>
 			<DialogContent className="sm:max-w-md" onInteractOutside={(e) => e.preventDefault()}>
 				<DialogHeader>
 					<DialogTitle className="flex items-center gap-2">
-						<img src="/providers/moclaw.svg" alt="MoClaw" className="h-6 w-6" onError={(e) => (e.currentTarget.style.display = "none")} />
+						<img
+							src="/providers/moclaw.svg"
+							alt=""
+							className="h-6 w-6"
+							onError={(e) => (e.currentTarget.style.display = "none")}
+						/>
 						{step === "choose" && "Add MoClaw Accounts"}
-						{step === "auto" && "Auto Login — Email & Password"}
+						{step === "browser" && "Auto Login via Google"}
 						{step === "manual" && "Manual — Paste Tokens"}
 					</DialogTitle>
 					{step === "choose" && (
@@ -166,90 +207,132 @@ export default function AddMoClawAccountsDialog({ open, onClose }: Props) {
 					)}
 				</DialogHeader>
 
-				{/* Step 1: choose */}
+				{/* ── Step 1: choose ─────────────────────────────────────────── */}
 				{step === "choose" && (
 					<div className="grid grid-cols-2 gap-3 py-2">
 						<button
-							onClick={() => setStep("auto")}
-							className="border-border hover:border-primary hover:bg-accent flex flex-col items-center gap-3 rounded-lg border-2 p-6 transition-colors"
+							onClick={() => setStep("browser")}
+							className="border-border hover:border-primary hover:bg-accent flex flex-col items-center gap-3 rounded-lg border-2 p-6 transition-colors text-left"
 						>
 							<MonitorSmartphone className="text-primary h-8 w-8" />
 							<div className="text-center">
 								<div className="font-semibold">Auto Login</div>
-								<div className="text-muted-foreground text-xs">Email &amp; password</div>
+								<div className="text-muted-foreground text-xs mt-1">Opens browser — login with Google</div>
 							</div>
 						</button>
 						<button
 							onClick={() => setStep("manual")}
-							className="border-primary bg-accent border-2 flex flex-col items-center gap-3 rounded-lg p-6 transition-colors"
+							className="border-border hover:border-primary hover:bg-accent flex flex-col items-center gap-3 rounded-lg border-2 p-6 transition-colors text-left"
 						>
 							<KeyIcon className="text-primary h-8 w-8" />
 							<div className="text-center">
 								<div className="font-semibold">Manual</div>
-								<div className="text-muted-foreground text-xs">Paste API key / token</div>
+								<div className="text-muted-foreground text-xs mt-1">Paste refresh / access token</div>
 							</div>
 						</button>
 					</div>
 				)}
 
-				{/* Step 2a: auto login */}
-				{step === "auto" && (
-					<div className="flex flex-col gap-3 py-2">
-						<label className="text-sm font-medium">
-							Accounts{" "}
-							<span className="text-muted-foreground font-normal">(email:password, one per line)</span>
-						</label>
-						<Textarea
-							placeholder={"email1@gmail.com:password123\nemail2@gmail.com:password456"}
-							rows={6}
-							value={inputText}
-							onChange={(e) => setInputText(e.target.value)}
-							className="font-mono text-sm"
-							autoFocus
-						/>
-						<p className="text-muted-foreground text-xs">
-							{lineCount} account{lineCount !== 1 ? "s" : ""}
-						</p>
+				{/* ── Step 2a: browser login ──────────────────────────────────── */}
+				{step === "browser" && (
+					<div className="flex flex-col gap-4 py-2">
+						{!isBrowserRunning && !browserStatus && (
+							<div className="text-muted-foreground rounded-lg border p-4 text-sm">
+								<p className="font-medium text-foreground mb-1">How it works</p>
+								<ol className="list-decimal list-inside space-y-1">
+									<li>Click <strong>Start Browser</strong> below</li>
+									<li>A Chrome window opens at moclaw.ai</li>
+									<li>Click <strong>Get Started</strong> → <strong>Continue with Google</strong></li>
+									<li>Complete Google login</li>
+									<li>Tokens are captured and saved automatically</li>
+								</ol>
+								<p className="mt-2 text-xs">Repeat for each additional account.</p>
+							</div>
+						)}
+
+						{browserStatus && (
+							<div className="rounded-lg border p-4 space-y-3">
+								<div className="flex items-center gap-2">
+									<StatusIcon status={browserStatus.status} />
+									<span className="font-medium capitalize">
+										{browserStatus.status === "done" ? "Login successful!" : browserStatus.status}
+									</span>
+								</div>
+								{(browserStatus.message || browserStatus.error) && (
+									<p className={`text-sm ${browserStatus.status === "error" ? "text-destructive" : "text-muted-foreground"}`}>
+										{browserStatus.error || browserStatus.message}
+									</p>
+								)}
+								{browserStatus.status === "done" && (
+									<Button
+										size="sm"
+										onClick={() => {
+											setBrowserStatus(null);
+										}}
+									>
+										Add another account
+									</Button>
+								)}
+							</div>
+						)}
+
+						{!isBrowserRunning && (
+							<Button onClick={handleBrowserLogin} className="w-full">
+								<MonitorSmartphone className="mr-2 h-4 w-4" />
+								{browserStatus?.status === "done" ? "Start new browser login" : "Start Browser"}
+							</Button>
+						)}
 					</div>
 				)}
 
-				{/* Step 2b: manual tokens */}
+				{/* ── Step 2b: manual tokens ──────────────────────────────────── */}
 				{step === "manual" && (
 					<div className="flex flex-col gap-3 py-2">
 						<label className="text-sm font-medium">
-							API Keys / Tokens{" "}
+							Tokens{" "}
 							<span className="text-muted-foreground font-normal">(one per line)</span>
 						</label>
 						<Textarea
-							placeholder={"eyJhbGci...(access_token)\nv1.MTI...(refresh_token)"}
+							placeholder={"eyJhbGci...   ← access_token (24h)\nv1.MTI...    ← refresh_token (30d)"}
 							rows={6}
-							value={inputText}
-							onChange={(e) => setInputText(e.target.value)}
+							value={manualText}
+							onChange={(e) => setManualText(e.target.value)}
 							className="font-mono text-xs"
 							autoFocus
 						/>
-						<p className="text-muted-foreground text-xs">
-							{lineCount} key{lineCount !== 1 ? "s" : ""}
-						</p>
+						<p className="text-muted-foreground text-xs">{manualLineCount} key{manualLineCount !== 1 ? "s" : ""}</p>
 					</div>
 				)}
 
 				<DialogFooter className="gap-2 sm:gap-0">
 					{step === "choose" ? (
-						<Button variant="outline" onClick={handleClose}>
+						<Button variant="outline" onClick={onClose}>
 							Cancel
+						</Button>
+					) : step === "browser" ? (
+						<Button
+							variant="outline"
+							onClick={() => {
+								stopEventSource();
+								setIsBrowserRunning(false);
+								setBrowserStatus(null);
+								setStep("choose");
+							}}
+							disabled={isBrowserRunning}
+						>
+							Back
 						</Button>
 					) : (
 						<>
-							<Button variant="outline" onClick={() => setStep("choose")} disabled={isSubmitting}>
+							<Button variant="outline" onClick={() => setStep("choose")} disabled={isManualSubmitting}>
 								Back
 							</Button>
 							<Button
-								onClick={step === "auto" ? handleAutoLogin : handleManual}
-								disabled={lineCount === 0 || isSubmitting}
-								isLoading={isSubmitting}
+								onClick={handleManual}
+								disabled={manualLineCount === 0 || isManualSubmitting}
+								isLoading={isManualSubmitting}
 							>
-								Add {lineCount > 0 ? `(${lineCount} account${lineCount !== 1 ? "s" : ""})` : "Accounts"}
+								Add {manualLineCount > 0 ? `(${manualLineCount})` : ""}
 							</Button>
 						</>
 					)}
