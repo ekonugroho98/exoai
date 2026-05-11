@@ -1,7 +1,6 @@
 "use client";
 
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import {
 	Dialog,
 	DialogContent,
@@ -9,6 +8,7 @@ import {
 	DialogHeader,
 	DialogTitle,
 } from "@/components/ui/dialog";
+import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { getErrorMessage } from "@/lib/store";
 import {
@@ -28,6 +28,11 @@ type AccountResult =
 	| { status: "done" }
 	| { status: "error"; error: string };
 
+interface BrowserAccount {
+	email: string;
+	password: string;
+}
+
 interface Props {
 	open: boolean;
 	onClose: () => void;
@@ -41,7 +46,8 @@ export default function AddMoClawAccountsDialog({ open, onClose }: Props) {
 	const [isManualSubmitting, setIsManualSubmitting] = useState(false);
 
 	// ── Browser-login state ───────────────────────────────────────────────────
-	const [accountCount, setAccountCount] = useState(1);
+	const [browserText, setBrowserText] = useState("");
+	const [headless, setHeadless] = useState(false);
 	const [isRunning, setIsRunning] = useState(false);
 	const [results, setResults] = useState<AccountResult[]>([]);
 	const evtSourceRef = useRef<EventSource | null>(null);
@@ -63,9 +69,10 @@ export default function AddMoClawAccountsDialog({ open, onClose }: Props) {
 			stopEventSource();
 			setStep("choose");
 			setManualText("");
+			setBrowserText("");
+			setHeadless(false);
 			setResults([]);
 			setIsRunning(false);
-			setAccountCount(1);
 		}
 		return () => stopEventSource();
 	}, [open, stopEventSource]);
@@ -94,13 +101,33 @@ export default function AddMoClawAccountsDialog({ open, onClose }: Props) {
 		});
 	}
 
-	// Run a single browser login session for one account and return success/fail
-	async function runOneSession(index: number): Promise<boolean> {
-		setResult(index, { status: "running", message: "Starting browser..." });
+	// ── Parse email:password textarea ─────────────────────────────────────────
+	function parseBrowserAccounts(): BrowserAccount[] {
+		return browserText
+			.split("\n")
+			.map((l) => l.trim())
+			.filter(Boolean)
+			.flatMap((line) => {
+				const idx = line.indexOf(":");
+				if (idx <= 0) return [];
+				const email = line.slice(0, idx).trim();
+				const password = line.slice(idx + 1).trim();
+				if (!email || !password) return [];
+				return [{ email, password }];
+			});
+	}
+
+	// ── Run one browser login session ─────────────────────────────────────────
+	async function runOneSession(index: number, account: BrowserAccount): Promise<boolean> {
+		setResult(index, { status: "running", message: "Starting..." });
 
 		let sessionId: string;
 		try {
-			const res = await startBrowserLogin().unwrap();
+			const res = await startBrowserLogin({
+				email: account.email,
+				password: account.password,
+				headless,
+			}).unwrap();
 			sessionId = res.session_id;
 		} catch (err) {
 			setResult(index, { status: "error", error: getErrorMessage(err) });
@@ -124,7 +151,7 @@ export default function AddMoClawAccountsDialog({ open, onClose }: Props) {
 						evtSourceRef.current = null;
 						const token = evt.refresh_token || evt.access_token || "";
 						try {
-							await createKey(`moclaw-account-${index + 1}`, token);
+							await createKey(account.email || `moclaw-account-${index + 1}`, token);
 							setResult(index, { status: "done" });
 							resolve(true);
 						} catch (err) {
@@ -137,7 +164,6 @@ export default function AddMoClawAccountsDialog({ open, onClose }: Props) {
 						setResult(index, { status: "error", error: evt.error || "Login failed" });
 						resolve(false);
 					} else {
-						// Progress update
 						setResult(index, { status: "running", message: evt.message || evt.status });
 					}
 				} catch {
@@ -156,21 +182,23 @@ export default function AddMoClawAccountsDialog({ open, onClose }: Props) {
 
 	// ── Start all sessions sequentially ───────────────────────────────────────
 	async function handleBrowserLoginAll() {
+		const accounts = parseBrowserAccounts();
+		if (!accounts.length) return;
+
 		abortRef.current = false;
 		setIsRunning(true);
-		// Initialise all slots as pending
-		setResults(Array.from({ length: accountCount }, () => ({ status: "pending" as const })));
+		setResults(accounts.map(() => ({ status: "pending" as const })));
 
 		let successCount = 0;
-		for (let i = 0; i < accountCount; i++) {
+		for (let i = 0; i < accounts.length; i++) {
 			if (abortRef.current) break;
-			const ok = await runOneSession(i);
+			const ok = await runOneSession(i, accounts[i]);
 			if (ok) successCount++;
 		}
 
 		setIsRunning(false);
 		if (successCount > 0) {
-			toast.success(`${successCount} of ${accountCount} account${accountCount > 1 ? "s" : ""} added`);
+			toast.success(`${successCount} of ${accounts.length} account${accounts.length > 1 ? "s" : ""} added`);
 		}
 	}
 
@@ -213,6 +241,7 @@ export default function AddMoClawAccountsDialog({ open, onClose }: Props) {
 		}
 	}
 
+	const browserAccounts = parseBrowserAccounts();
 	const manualEntries = parseManualLines();
 	const manualLineCount = manualEntries.length;
 	const allDone = results.length > 0 && results.every((r) => r.status === "done" || r.status === "error");
@@ -253,7 +282,7 @@ export default function AddMoClawAccountsDialog({ open, onClose }: Props) {
 							<MonitorSmartphone className="text-primary h-8 w-8" />
 							<div className="text-center">
 								<div className="font-semibold">Auto Login</div>
-								<div className="text-muted-foreground text-xs mt-1">Opens browser — login with Google</div>
+								<div className="text-muted-foreground text-xs mt-1">Paste email:password — logs in automatically</div>
 							</div>
 						</button>
 						<button
@@ -269,32 +298,53 @@ export default function AddMoClawAccountsDialog({ open, onClose }: Props) {
 					</div>
 				)}
 
-				{/* ── Step 2a: browser login ──────────────────────────────────── */}
+				{/* ── Step 2a: auto login ───────────────────────────────────── */}
 				{step === "browser" && (
 					<div className="flex flex-col gap-4 py-2">
-						{/* Account count picker — only shown before starting */}
+						{/* Input area — only shown before starting */}
 						{!isRunning && results.length === 0 && (
 							<>
-								<div className="flex items-center gap-3">
-									<label className="text-sm font-medium whitespace-nowrap">Number of accounts</label>
-									<Input
-										type="number"
-										min={1}
-										max={20}
-										value={accountCount}
-										onChange={(e) => setAccountCount(Math.max(1, Math.min(20, Number(e.target.value) || 1)))}
-										className="w-24 font-mono text-center"
+								<div>
+									<label className="text-sm font-medium">
+										Accounts{" "}
+										<span className="text-muted-foreground font-normal">(one per line — email:password)</span>
+									</label>
+									<Textarea
+										placeholder={"user@gmail.com:MyPassword123\nother@gmail.com:AnotherPass456"}
+										rows={5}
+										value={browserText}
+										onChange={(e) => setBrowserText(e.target.value)}
+										className="font-mono text-xs mt-2"
+										autoFocus
 									/>
+									{browserAccounts.length > 0 && (
+										<p className="text-muted-foreground text-xs mt-1">
+											{browserAccounts.length} account{browserAccounts.length > 1 ? "s" : ""} detected
+										</p>
+									)}
 								</div>
-								<div className="text-muted-foreground rounded-lg border p-4 text-sm">
-									<p className="font-medium text-foreground mb-1">How it works</p>
-									<ol className="list-decimal list-inside space-y-1">
-										<li>Click <strong>Start</strong> — a Chrome window opens at moclaw.ai</li>
-										<li>Click <strong>Get Started</strong> → <strong>Continue with Google</strong></li>
-										<li>Complete Google login in the browser window</li>
-										<li>Tokens are captured and saved automatically</li>
-										{accountCount > 1 && <li>Next window opens automatically for the next account</li>}
-									</ol>
+
+								{/* Headless toggle */}
+								<div className="flex items-center justify-between rounded-lg border px-4 py-3">
+									<div>
+										<p className="text-sm font-medium">Headless mode</p>
+										<p className="text-muted-foreground text-xs mt-0.5">
+											Run browser invisibly — disable if login requires 2FA or captcha
+										</p>
+									</div>
+									<Switch checked={headless} onCheckedChange={setHeadless} />
+								</div>
+
+								<div className="text-muted-foreground rounded-lg border p-3 text-xs space-y-1">
+									<p className="font-medium text-foreground text-sm mb-1">Requirements</p>
+									<p>• Python 3 must be installed</p>
+									<p>
+										• For best results:{" "}
+										<code className="bg-muted px-1 rounded">pip install &apos;camoufox[geoip]&apos;</code>
+										{" && "}
+										<code className="bg-muted px-1 rounded">python -m camoufox fetch</code>
+									</p>
+									<p>• Falls back to Playwright/Chromium if camoufox is not installed</p>
 								</div>
 							</>
 						)}
@@ -304,11 +354,13 @@ export default function AddMoClawAccountsDialog({ open, onClose }: Props) {
 							<div className="flex flex-col gap-1.5 max-h-64 overflow-y-auto">
 								{results.map((r, i) => (
 									<div key={i} className="flex items-center gap-2 rounded-md border px-3 py-2 text-sm">
-										{r.status === "pending" && <div className="h-4 w-4 rounded-full border-2 border-muted" />}
+										{r.status === "pending" && <div className="h-4 w-4 rounded-full border-2 border-muted shrink-0" />}
 										{r.status === "running" && <Loader2 className="h-4 w-4 animate-spin text-primary shrink-0" />}
 										{r.status === "done" && <CheckCircle2 className="h-4 w-4 text-green-500 shrink-0" />}
 										{r.status === "error" && <XCircle className="h-4 w-4 text-destructive shrink-0" />}
-										<span className="font-medium">Account {i + 1}</span>
+										<span className="font-medium shrink-0">
+											{browserAccounts[i]?.email || `Account ${i + 1}`}
+										</span>
 										{r.status === "running" && (
 											<span className="text-muted-foreground text-xs truncate">{r.message}</span>
 										)}
@@ -326,20 +378,25 @@ export default function AddMoClawAccountsDialog({ open, onClose }: Props) {
 							</div>
 						)}
 
-						{/* Action buttons */}
+						{/* Start button */}
 						{!isRunning && results.length === 0 && (
-							<Button onClick={handleBrowserLoginAll} className="w-full">
+							<Button
+								onClick={handleBrowserLoginAll}
+								disabled={browserAccounts.length === 0}
+								className="w-full"
+							>
 								<MonitorSmartphone className="mr-2 h-4 w-4" />
-								Start ({accountCount} account{accountCount > 1 ? "s" : ""})
+								Start ({browserAccounts.length} account{browserAccounts.length !== 1 ? "s" : ""})
 							</Button>
 						)}
 
+						{/* Add more after completion */}
 						{!isRunning && allDone && (
 							<Button
 								variant="outline"
 								onClick={() => {
 									setResults([]);
-									setAccountCount(1);
+									setBrowserText("");
 								}}
 								className="w-full"
 							>
@@ -349,7 +406,7 @@ export default function AddMoClawAccountsDialog({ open, onClose }: Props) {
 					</div>
 				)}
 
-				{/* ── Step 2b: manual tokens ──────────────────────────────────── */}
+				{/* ── Step 2b: manual tokens ────────────────────────────────── */}
 				{step === "manual" && (
 					<div className="flex flex-col gap-3 py-2">
 						<label className="text-sm font-medium">

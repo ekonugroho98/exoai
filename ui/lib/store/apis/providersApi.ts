@@ -341,10 +341,11 @@ export const providersApi = baseApi.injectEndpoints({
 			}),
 		}),
 
-		moclawBrowserLoginStart: builder.mutation<{ session_id: string }, void>({
-			query: () => ({
+		moclawBrowserLoginStart: builder.mutation<{ session_id: string }, { email: string; password: string; headless: boolean }>({
+			query: (body) => ({
 				url: '/providers/moclaw/browser-login',
 				method: 'POST',
+				body,
 			}),
 		}),
 
