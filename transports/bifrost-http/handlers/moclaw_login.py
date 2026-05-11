@@ -12,6 +12,7 @@ Stdout protocol:
 import asyncio
 import json
 import sys
+import urllib.request
 
 EMAIL    = sys.argv[1]
 PASSWORD = sys.argv[2]
@@ -237,34 +238,67 @@ async def do_login(page) -> None:
         pass
     await page.wait_for_timeout(2000)
 
-    # ── "Start Free Trial" modal (new accounts, slow to appear) ──────────────
-    try:
-        btn = page.locator("button:has-text('Start Free Trial')").first
-        await btn.wait_for(state="visible", timeout=15000)
-        prog("Clicking Start Free Trial...")
-        await btn.click()
-        await page.wait_for_timeout(1500)
-    except Exception:
-        pass
+    # ── Poll for "Start Free Trial" modal (new accounts, can take 5-30s) ──────
+    # Don't use networkidle — dashboard keeps firing API calls indefinitely.
+    # Just poll every second for up to 35 seconds.
+    prog("Waiting for Free Trial modal...")
+    trial_deadline = asyncio.get_event_loop().time() + 35
+    trial_clicked = False
+    while asyncio.get_event_loop().time() < trial_deadline:
+        try:
+            btn = page.locator("button:has-text('Start Free Trial')").first
+            if await btn.is_visible(timeout=800):
+                prog("Clicking Start Free Trial...")
+                await btn.click()
+                trial_clicked = True
+                await page.wait_for_timeout(2000)
+                break
+        except Exception:
+            pass
+        await asyncio.sleep(1)
+
+    if not trial_clicked:
+        prog("Start Free Trial modal not seen — account may already have a plan")
 
     # ── "Trial started! → Get started" confirmation modal ────────────────────
-    try:
-        btn = page.locator("button:has-text('Get started')").first
-        if await btn.is_visible(timeout=5000):
-            prog("Trial started! Clicking Get started...")
-            await btn.click()
-            await page.wait_for_timeout(1000)
-    except Exception:
-        pass
+    if trial_clicked:
+        try:
+            btn = page.locator("button:has-text('Get started')").first
+            if await btn.is_visible(timeout=8000):
+                prog("Trial started! Clicking Get started...")
+                await btn.click()
+                await page.wait_for_timeout(1000)
+        except Exception:
+            pass
 
     # ── Extract tokens from localStorage ─────────────────────────────────────
     prog("Extracting tokens from localStorage...")
     tokens = await poll_tokens(page)
-    if tokens:
-        done(tokens)
-    else:
+    if not tokens:
         hint = " (try non-headless mode to handle 2FA / captcha)" if HEADLESS else ""
         err(f"Login completed but tokens not found in localStorage{hint}")
+        return
+
+    # ── Validate balance via API ──────────────────────────────────────────────
+    try:
+        access_token = json.loads(tokens).get("access_token", "")
+        req = urllib.request.Request(
+            "https://api.moclaw.ai/api/credits/balance",
+            headers={
+                "authorization": f"Bearer {access_token}",
+                "content-type": "application/json",
+                "origin": "https://moclaw.ai",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            bal = json.loads(resp.read())
+            total = bal.get("total_balance", "?")
+            plan  = bal.get("plan", {}).get("display_name", "?")
+            prog(f"Balance validated: {total} credits ({plan})")
+    except Exception as e:
+        prog(f"Balance check skipped: {e}")
+
+    done(tokens)
 
 
 async def main() -> None:
