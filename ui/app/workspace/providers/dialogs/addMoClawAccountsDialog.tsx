@@ -1,6 +1,7 @@
 "use client";
 
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
 	Dialog,
 	DialogContent,
@@ -13,7 +14,6 @@ import { getErrorMessage } from "@/lib/store";
 import {
 	useCreateProviderKeyMutation,
 	useMoclawBrowserLoginStartMutation,
-	useMoclawLoginMutation,
 } from "@/lib/store/apis/providersApi";
 import { CheckCircle2, KeyIcon, Loader2, MonitorSmartphone, XCircle } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -22,14 +22,11 @@ import { v4 as uuid } from "uuid";
 
 type Step = "choose" | "browser" | "manual";
 
-interface BrowserLoginStatus {
-	status: "launching" | "connecting" | "navigating" | "waiting" | "done" | "error";
-	message?: string;
-	access_token?: string;
-	refresh_token?: string;
-	expires_in?: number;
-	error?: string;
-}
+type AccountResult =
+	| { status: "pending" }
+	| { status: "running"; message: string }
+	| { status: "done" }
+	| { status: "error"; error: string };
 
 interface Props {
 	open: boolean;
@@ -44,29 +41,31 @@ export default function AddMoClawAccountsDialog({ open, onClose }: Props) {
 	const [isManualSubmitting, setIsManualSubmitting] = useState(false);
 
 	// ── Browser-login state ───────────────────────────────────────────────────
-	const [browserStatus, setBrowserStatus] = useState<BrowserLoginStatus | null>(null);
-	const [isBrowserRunning, setIsBrowserRunning] = useState(false);
+	const [accountCount, setAccountCount] = useState(1);
+	const [isRunning, setIsRunning] = useState(false);
+	const [results, setResults] = useState<AccountResult[]>([]);
 	const evtSourceRef = useRef<EventSource | null>(null);
+	const abortRef = useRef(false);
 
 	// ── API hooks ─────────────────────────────────────────────────────────────
 	const [startBrowserLogin] = useMoclawBrowserLoginStartMutation();
 	const [createProviderKey] = useCreateProviderKeyMutation();
 
-	// ── Cleanup on unmount or dialog close ───────────────────────────────────
+	// ── Cleanup ───────────────────────────────────────────────────────────────
 	const stopEventSource = useCallback(() => {
-		if (evtSourceRef.current) {
-			evtSourceRef.current.close();
-			evtSourceRef.current = null;
-		}
+		evtSourceRef.current?.close();
+		evtSourceRef.current = null;
 	}, []);
 
 	useEffect(() => {
 		if (!open) {
+			abortRef.current = true;
 			stopEventSource();
 			setStep("choose");
 			setManualText("");
-			setBrowserStatus(null);
-			setIsBrowserRunning(false);
+			setResults([]);
+			setIsRunning(false);
+			setAccountCount(1);
 		}
 		return () => stopEventSource();
 	}, [open, stopEventSource]);
@@ -87,83 +86,109 @@ export default function AddMoClawAccountsDialog({ open, onClose }: Props) {
 		}).unwrap();
 	}
 
-	// ── Browser login ─────────────────────────────────────────────────────────
-	async function handleBrowserLogin() {
-		setIsBrowserRunning(true);
-		setBrowserStatus({ status: "launching", message: "Starting browser..." });
+	function setResult(index: number, result: AccountResult) {
+		setResults((prev) => {
+			const next = [...prev];
+			next[index] = result;
+			return next;
+		});
+	}
+
+	// Run a single browser login session for one account and return success/fail
+	async function runOneSession(index: number): Promise<boolean> {
+		setResult(index, { status: "running", message: "Starting browser..." });
 
 		let sessionId: string;
 		try {
 			const res = await startBrowserLogin().unwrap();
 			sessionId = res.session_id;
 		} catch (err) {
-			setBrowserStatus({ status: "error", error: getErrorMessage(err) });
-			setIsBrowserRunning(false);
-			return;
+			setResult(index, { status: "error", error: getErrorMessage(err) });
+			return false;
 		}
 
-		// Connect to SSE stream
-		const es = new EventSource(`/api/providers/moclaw/browser-login/${sessionId}`);
-		evtSourceRef.current = es;
+		return new Promise<boolean>((resolve) => {
+			const es = new EventSource(`/api/providers/moclaw/browser-login/${sessionId}`);
+			evtSourceRef.current = es;
 
-		es.addEventListener("status", async (e) => {
-			try {
-				const evt: BrowserLoginStatus = JSON.parse((e as MessageEvent).data);
-				setBrowserStatus(evt);
-
-				if (evt.status === "done") {
+			es.addEventListener("status", async (e) => {
+				if (abortRef.current) {
 					es.close();
-					evtSourceRef.current = null;
-					const token = evt.refresh_token || evt.access_token || "";
-					if (token) {
-						try {
-							await createKey(`moclaw-${Date.now()}`, token);
-							toast.success("Account added successfully");
-							setIsBrowserRunning(false);
-							setBrowserStatus(null);
-							// Stay on browser step so user can add more accounts
-						} catch (err) {
-							setBrowserStatus({ status: "error", error: `Key save failed: ${getErrorMessage(err)}` });
-						}
-					}
-					setIsBrowserRunning(false);
-				} else if (evt.status === "error") {
-					es.close();
-					evtSourceRef.current = null;
-					setIsBrowserRunning(false);
+					resolve(false);
+					return;
 				}
-			} catch {}
-		});
+				try {
+					const evt = JSON.parse((e as MessageEvent).data);
+					if (evt.status === "done") {
+						es.close();
+						evtSourceRef.current = null;
+						const token = evt.refresh_token || evt.access_token || "";
+						try {
+							await createKey(`moclaw-account-${index + 1}`, token);
+							setResult(index, { status: "done" });
+							resolve(true);
+						} catch (err) {
+							setResult(index, { status: "error", error: `Key save failed: ${getErrorMessage(err)}` });
+							resolve(false);
+						}
+					} else if (evt.status === "error") {
+						es.close();
+						evtSourceRef.current = null;
+						setResult(index, { status: "error", error: evt.error || "Login failed" });
+						resolve(false);
+					} else {
+						// Progress update
+						setResult(index, { status: "running", message: evt.message || evt.status });
+					}
+				} catch {
+					resolve(false);
+				}
+			});
 
-		es.onerror = () => {
-			es.close();
-			evtSourceRef.current = null;
-			if (isBrowserRunning) {
-				setBrowserStatus({ status: "error", error: "Connection to server lost" });
-				setIsBrowserRunning(false);
-			}
-		};
+			es.onerror = () => {
+				es.close();
+				evtSourceRef.current = null;
+				setResult(index, { status: "error", error: "Connection to server lost" });
+				resolve(false);
+			};
+		});
+	}
+
+	// ── Start all sessions sequentially ───────────────────────────────────────
+	async function handleBrowserLoginAll() {
+		abortRef.current = false;
+		setIsRunning(true);
+		// Initialise all slots as pending
+		setResults(Array.from({ length: accountCount }, () => ({ status: "pending" as const })));
+
+		let successCount = 0;
+		for (let i = 0; i < accountCount; i++) {
+			if (abortRef.current) break;
+			const ok = await runOneSession(i);
+			if (ok) successCount++;
+		}
+
+		setIsRunning(false);
+		if (successCount > 0) {
+			toast.success(`${successCount} of ${accountCount} account${accountCount > 1 ? "s" : ""} added`);
+		}
 	}
 
 	// ── Manual login ──────────────────────────────────────────────────────────
-	// Parse lines of format "email:token" or just "token"
 	function parseManualLines(): Array<{ name: string; token: string }> {
 		return manualText
 			.split("\n")
 			.map((l) => l.trim())
 			.filter(Boolean)
 			.map((line, i) => {
-				// Detect "email:token" — token part starts with eyJ (JWT) or v1.
 				const colonIdx = line.indexOf(":");
 				if (colonIdx > 0) {
 					const possibleEmail = line.slice(0, colonIdx).trim();
 					const possibleToken = line.slice(colonIdx + 1).trim();
-					// Only treat as email:token if token looks like a real token
 					if (possibleToken.startsWith("eyJ") || possibleToken.startsWith("v1.")) {
 						return { name: possibleEmail || `moclaw-account-${i + 1}`, token: possibleToken };
 					}
 				}
-				// Plain token — auto name
 				return { name: `moclaw-account-${i + 1}`, token: line };
 			});
 	}
@@ -188,21 +213,16 @@ export default function AddMoClawAccountsDialog({ open, onClose }: Props) {
 		}
 	}
 
-	// ── Status icon helper ────────────────────────────────────────────────────
-	function StatusIcon({ status }: { status: BrowserLoginStatus["status"] }) {
-		if (status === "done") return <CheckCircle2 className="h-5 w-5 text-green-500" />;
-		if (status === "error") return <XCircle className="h-5 w-5 text-destructive" />;
-		return <Loader2 className="h-5 w-5 animate-spin text-primary" />;
-	}
-
 	const manualEntries = parseManualLines();
 	const manualLineCount = manualEntries.length;
+	const allDone = results.length > 0 && results.every((r) => r.status === "done" || r.status === "error");
+	const anySuccess = results.some((r) => r.status === "done");
 
 	return (
 		<Dialog
 			open={open}
 			onOpenChange={(o) => {
-				if (!o && !isBrowserRunning) onClose();
+				if (!o && !isRunning) onClose();
 			}}
 		>
 			<DialogContent className="sm:max-w-md" onInteractOutside={(e) => e.preventDefault()}>
@@ -252,50 +272,78 @@ export default function AddMoClawAccountsDialog({ open, onClose }: Props) {
 				{/* ── Step 2a: browser login ──────────────────────────────────── */}
 				{step === "browser" && (
 					<div className="flex flex-col gap-4 py-2">
-						{!isBrowserRunning && !browserStatus && (
-							<div className="text-muted-foreground rounded-lg border p-4 text-sm">
-								<p className="font-medium text-foreground mb-1">How it works</p>
-								<ol className="list-decimal list-inside space-y-1">
-									<li>Click <strong>Start Browser</strong> below</li>
-									<li>A Chrome window opens at moclaw.ai</li>
-									<li>Click <strong>Get Started</strong> → <strong>Continue with Google</strong></li>
-									<li>Complete Google login</li>
-									<li>Tokens are captured and saved automatically</li>
-								</ol>
-								<p className="mt-2 text-xs">Repeat for each additional account.</p>
-							</div>
-						)}
-
-						{browserStatus && (
-							<div className="rounded-lg border p-4 space-y-3">
-								<div className="flex items-center gap-2">
-									<StatusIcon status={browserStatus.status} />
-									<span className="font-medium capitalize">
-										{browserStatus.status === "done" ? "Login successful!" : browserStatus.status}
-									</span>
+						{/* Account count picker — only shown before starting */}
+						{!isRunning && results.length === 0 && (
+							<>
+								<div className="flex items-center gap-3">
+									<label className="text-sm font-medium whitespace-nowrap">Number of accounts</label>
+									<Input
+										type="number"
+										min={1}
+										max={20}
+										value={accountCount}
+										onChange={(e) => setAccountCount(Math.max(1, Math.min(20, Number(e.target.value) || 1)))}
+										className="w-24 font-mono text-center"
+									/>
 								</div>
-								{(browserStatus.message || browserStatus.error) && (
-									<p className={`text-sm ${browserStatus.status === "error" ? "text-destructive" : "text-muted-foreground"}`}>
-										{browserStatus.error || browserStatus.message}
-									</p>
-								)}
-								{browserStatus.status === "done" && (
-									<Button
-										size="sm"
-										onClick={() => {
-											setBrowserStatus(null);
-										}}
-									>
-										Add another account
-									</Button>
-								)}
+								<div className="text-muted-foreground rounded-lg border p-4 text-sm">
+									<p className="font-medium text-foreground mb-1">How it works</p>
+									<ol className="list-decimal list-inside space-y-1">
+										<li>Click <strong>Start</strong> — a Chrome window opens at moclaw.ai</li>
+										<li>Click <strong>Get Started</strong> → <strong>Continue with Google</strong></li>
+										<li>Complete Google login in the browser window</li>
+										<li>Tokens are captured and saved automatically</li>
+										{accountCount > 1 && <li>Next window opens automatically for the next account</li>}
+									</ol>
+								</div>
+							</>
+						)}
+
+						{/* Progress list */}
+						{results.length > 0 && (
+							<div className="flex flex-col gap-1.5 max-h-64 overflow-y-auto">
+								{results.map((r, i) => (
+									<div key={i} className="flex items-center gap-2 rounded-md border px-3 py-2 text-sm">
+										{r.status === "pending" && <div className="h-4 w-4 rounded-full border-2 border-muted" />}
+										{r.status === "running" && <Loader2 className="h-4 w-4 animate-spin text-primary shrink-0" />}
+										{r.status === "done" && <CheckCircle2 className="h-4 w-4 text-green-500 shrink-0" />}
+										{r.status === "error" && <XCircle className="h-4 w-4 text-destructive shrink-0" />}
+										<span className="font-medium">Account {i + 1}</span>
+										{r.status === "running" && (
+											<span className="text-muted-foreground text-xs truncate">{r.message}</span>
+										)}
+										{r.status === "error" && (
+											<span className="text-destructive text-xs truncate">{r.error}</span>
+										)}
+										{r.status === "done" && (
+											<span className="text-green-600 text-xs">Saved ✓</span>
+										)}
+										{r.status === "pending" && (
+											<span className="text-muted-foreground text-xs">Waiting...</span>
+										)}
+									</div>
+								))}
 							</div>
 						)}
 
-						{!isBrowserRunning && (
-							<Button onClick={handleBrowserLogin} className="w-full">
+						{/* Action buttons */}
+						{!isRunning && results.length === 0 && (
+							<Button onClick={handleBrowserLoginAll} className="w-full">
 								<MonitorSmartphone className="mr-2 h-4 w-4" />
-								{browserStatus?.status === "done" ? "Start new browser login" : "Start Browser"}
+								Start ({accountCount} account{accountCount > 1 ? "s" : ""})
+							</Button>
+						)}
+
+						{!isRunning && allDone && (
+							<Button
+								variant="outline"
+								onClick={() => {
+									setResults([]);
+									setAccountCount(1);
+								}}
+								className="w-full"
+							>
+								Add more accounts
 							</Button>
 						)}
 					</div>
@@ -337,18 +385,36 @@ export default function AddMoClawAccountsDialog({ open, onClose }: Props) {
 							Cancel
 						</Button>
 					) : step === "browser" ? (
-						<Button
-							variant="outline"
-							onClick={() => {
-								stopEventSource();
-								setIsBrowserRunning(false);
-								setBrowserStatus(null);
-								setStep("choose");
-							}}
-							disabled={isBrowserRunning}
-						>
-							Back
-						</Button>
+						<div className="flex w-full justify-between gap-2">
+							<Button
+								variant="outline"
+								onClick={() => {
+									abortRef.current = true;
+									stopEventSource();
+									setIsRunning(false);
+									setResults([]);
+									setStep("choose");
+								}}
+								disabled={isRunning}
+							>
+								Back
+							</Button>
+							{allDone && anySuccess && (
+								<Button onClick={onClose}>Done</Button>
+							)}
+							{isRunning && (
+								<Button
+									variant="destructive"
+									onClick={() => {
+										abortRef.current = true;
+										stopEventSource();
+										setIsRunning(false);
+									}}
+								>
+									Stop
+								</Button>
+							)}
+						</div>
 					) : (
 						<>
 							<Button variant="outline" onClick={() => setStep("choose")} disabled={isManualSubmitting}>
