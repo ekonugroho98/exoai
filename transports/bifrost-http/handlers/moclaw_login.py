@@ -133,10 +133,19 @@ async def do_login(page) -> None:
         err(f"Password field not found (2FA required? wrong credentials?): {e}")
         return
 
-    # Handle Google "Welcome to your new account" / "I understand" interstitial.
-    # Only present for new/Workspace accounts — silently skip if not found.
+    # Handle Google "Welcome to your new account" interstitial.
+    # Button text varies by browser locale — cover EN + ID + common languages.
+    _understand_texts = [
+        "I understand",   # EN
+        "Saya mengerti",  # ID
+        "Je comprends",   # FR
+        "Ich verstehe",   # DE
+        "Entendido",      # ES/PT
+        "Ho capito",      # IT
+    ]
     try:
-        btn = page.locator("button:has-text('I understand'), input[value='I understand']").first
+        selector = ", ".join(f"button:has-text('{t}')" for t in _understand_texts)
+        btn = page.locator(selector).first
         if await btn.is_visible(timeout=2000):
             prog("Clicking 'I understand'...")
             await btn.click()
@@ -144,10 +153,18 @@ async def do_login(page) -> None:
     except Exception:
         pass  # Not present — normal for existing/personal accounts
 
-    # Handle Google OAuth consent screen ("Sign in to auth0.com" → Continue).
-    # Appears on first-time authorization for new accounts.
+    # Handle Google OAuth consent screen ("Sign in to auth0.com" → Continue/Lanjutkan).
+    _continue_texts = [
+        "Continue",    # EN
+        "Lanjutkan",   # ID
+        "Continuer",   # FR
+        "Weiter",      # DE
+        "Continuar",   # ES/PT
+        "Continua",    # IT
+    ]
     try:
-        btn = page.locator("button:has-text('Continue')").first
+        selector = ", ".join(f"button:has-text('{t}')" for t in _continue_texts)
+        btn = page.locator(selector).first
         if await btn.is_visible(timeout=3000):
             prog("Clicking Continue on Google consent screen...")
             await btn.click()
