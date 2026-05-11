@@ -53,6 +53,37 @@ EXTRACT_JS = """
 }
 """
 
+_GOOGLE_SELECTORS = [
+    "text=Continue with Google",
+    "button:has-text('Google')",
+    "a:has-text('Google')",
+    "[data-provider='google']",
+    "[data-connection='google']",
+    "[data-action='google']",
+]
+
+# "I understand" in multiple locales (Google Workspace new-account interstitial)
+_UNDERSTAND_TEXTS = [
+    "I understand",   # EN
+    "Saya mengerti",  # ID
+    "Saya faham",     # MS (Malay)
+    "Je comprends",   # FR
+    "Ich verstehe",   # DE
+    "Entendido",      # ES/PT
+    "Ho capito",      # IT
+]
+
+# "Continue" in multiple locales (Google OAuth consent screen)
+_CONTINUE_TEXTS = [
+    "Continue",    # EN
+    "Lanjutkan",   # ID
+    "Teruskan",    # MS (Malay)
+    "Continuer",   # FR
+    "Weiter",      # DE
+    "Continuar",   # ES/PT
+    "Continua",    # IT
+]
+
 
 async def poll_tokens(page, tries: int = 30) -> str | None:
     """Poll localStorage every second until tokens appear or tries exhausted."""
@@ -64,12 +95,38 @@ async def poll_tokens(page, tries: int = 30) -> str | None:
     return None
 
 
+async def fill_google_credentials(login_page) -> bool:
+    """Fill email + password on whichever page context Google opened in."""
+    # Email
+    prog("Entering Google email...")
+    try:
+        await login_page.wait_for_selector('input[type="email"]', timeout=15000)
+        await login_page.fill('input[type="email"]', EMAIL)
+        await login_page.keyboard.press("Enter")
+    except Exception as e:
+        err(f"Email input not found: {e}")
+        return False
+
+    # Password
+    prog("Entering Google password...")
+    try:
+        await login_page.wait_for_selector('input[type="password"]', timeout=15000)
+        await login_page.wait_for_timeout(500)
+        await login_page.fill('input[type="password"]', PASSWORD)
+        await login_page.keyboard.press("Enter")
+    except Exception as e:
+        err(f"Password field not found (2FA required? wrong credentials?): {e}")
+        return False
+
+    return True
+
+
 async def do_login(page) -> None:
     prog("Navigating to moclaw.ai...")
     await page.goto("https://moclaw.ai/", timeout=30000, wait_until="domcontentloaded")
     await page.wait_for_timeout(2500)
 
-    # Click "Get Started"
+    # ── Click "Get Started" ───────────────────────────────────────────────────
     prog("Clicking Get Started...")
     clicked = False
     for selector in [
@@ -91,96 +148,74 @@ async def do_login(page) -> None:
             pass
     await page.wait_for_timeout(1500)
 
-    # Click "Continue with Google"
+    # ── Click "Continue with Google" — may open popup or redirect in-page ────
     prog("Clicking Continue with Google...")
-    google_clicked = False
-    for selector in [
-        "text=Continue with Google",
-        "button:has-text('Google')",
-        "a:has-text('Google')",
-        "[data-provider='google']",
-        "[data-connection='google']",
-        "[data-action='google']",
-    ]:
-        try:
-            await page.locator(selector).first.click(timeout=5000)
-            google_clicked = True
-            break
-        except Exception:
-            continue
-    if not google_clicked:
-        err("Cannot find 'Continue with Google' button — page layout may have changed")
+
+    login_page = page  # default: same-page flow
+    popup_detected = False
+
+    try:
+        # Listen for a popup BEFORE clicking so we don't miss it
+        async with page.expect_popup(timeout=8000) as popup_info:
+            for selector in _GOOGLE_SELECTORS:
+                try:
+                    await page.locator(selector).first.click(timeout=3000)
+                    break
+                except Exception:
+                    continue
+        popup = await popup_info.value
+        await popup.wait_for_load_state("domcontentloaded")
+        login_page = popup
+        popup_detected = True
+        prog("Google login opened in popup window")
+    except Exception:
+        # No popup within timeout — Google redirected in the same tab
+        if not popup_detected:
+            for selector in _GOOGLE_SELECTORS:
+                try:
+                    if await page.locator(selector).first.is_visible(timeout=2000):
+                        await page.locator(selector).first.click()
+                        break
+                except Exception:
+                    continue
+        login_page = page
+        prog("Google login in same tab")
+
+    # ── Fill credentials in the correct page context ──────────────────────────
+    if not await fill_google_credentials(login_page):
         return
 
-    # Google: enter email
-    prog("Entering Google email...")
+    # ── Handle "I understand" interstitial (Workspace new accounts) ───────────
     try:
-        await page.wait_for_selector('input[type="email"]', timeout=15000)
-        await page.fill('input[type="email"]', EMAIL)
-        await page.keyboard.press("Enter")
-    except Exception as e:
-        err(f"Email input not found: {e}")
-        return
-
-    # Google: enter password
-    prog("Entering Google password...")
-    try:
-        await page.wait_for_selector('input[type="password"]', timeout=15000)
-        await page.wait_for_timeout(500)
-        await page.fill('input[type="password"]', PASSWORD)
-        await page.keyboard.press("Enter")
-    except Exception as e:
-        err(f"Password field not found (2FA required? wrong credentials?): {e}")
-        return
-
-    # Handle Google "Welcome to your new account" interstitial.
-    # Button text varies by browser locale — cover EN + ID + common languages.
-    _understand_texts = [
-        "I understand",   # EN
-        "Saya mengerti",  # ID
-        "Je comprends",   # FR
-        "Ich verstehe",   # DE
-        "Entendido",      # ES/PT
-        "Ho capito",      # IT
-    ]
-    try:
-        selector = ", ".join(f"button:has-text('{t}')" for t in _understand_texts)
-        btn = page.locator(selector).first
-        if await btn.is_visible(timeout=2000):
+        selector = ", ".join(f"button:has-text('{t}')" for t in _UNDERSTAND_TEXTS)
+        btn = login_page.locator(selector).first
+        if await btn.is_visible(timeout=3000):
             prog("Clicking 'I understand'...")
             await btn.click()
-            await page.wait_for_timeout(1000)
+            await login_page.wait_for_timeout(1000)
     except Exception:
-        pass  # Not present — normal for existing/personal accounts
+        pass
 
-    # Handle Google OAuth consent screen ("Sign in to auth0.com" → Continue/Lanjutkan).
-    _continue_texts = [
-        "Continue",    # EN
-        "Lanjutkan",   # ID
-        "Continuer",   # FR
-        "Weiter",      # DE
-        "Continuar",   # ES/PT
-        "Continua",    # IT
-    ]
+    # ── Handle "Continue/Lanjutkan" OAuth consent screen ─────────────────────
     try:
-        selector = ", ".join(f"button:has-text('{t}')" for t in _continue_texts)
-        btn = page.locator(selector).first
-        if await btn.is_visible(timeout=3000):
+        selector = ", ".join(f"button:has-text('{t}')" for t in _CONTINUE_TEXTS)
+        btn = login_page.locator(selector).first
+        if await btn.is_visible(timeout=4000):
             prog("Clicking Continue on Google consent screen...")
             await btn.click()
-            await page.wait_for_timeout(1000)
+            await login_page.wait_for_timeout(1000)
     except Exception:
-        pass  # Not present — already authorized before
+        pass
 
-    # Wait for redirect back to moclaw.ai
-    prog("Waiting for redirect to moclaw.ai...")
+    # ── Wait for moclaw.ai to load (main page may redirect while popup closes)
+    prog("Waiting for moclaw.ai to load...")
     try:
         await page.wait_for_url("*moclaw.ai*", timeout=30000)
     except Exception:
-        pass  # May already be there or may have a different URL pattern
+        pass
     await page.wait_for_timeout(2000)
 
-    # Handle "Free Trial" modal — appears for new accounts, can be slow to load.
+    # ── "Start Free Trial" modal (new accounts, slow to appear) ──────────────
     try:
         btn = page.locator("button:has-text('Start Free Trial')").first
         await btn.wait_for(state="visible", timeout=15000)
@@ -188,9 +223,9 @@ async def do_login(page) -> None:
         await btn.click()
         await page.wait_for_timeout(1500)
     except Exception:
-        pass  # Not present — account already has a plan
+        pass
 
-    # Handle "Trial started!" confirmation modal → click "Get started" to dismiss.
+    # ── "Trial started! → Get started" confirmation modal ────────────────────
     try:
         btn = page.locator("button:has-text('Get started')").first
         if await btn.is_visible(timeout=5000):
@@ -200,7 +235,7 @@ async def do_login(page) -> None:
     except Exception:
         pass
 
-    # Extract tokens
+    # ── Extract tokens from localStorage ─────────────────────────────────────
     prog("Extracting tokens from localStorage...")
     tokens = await poll_tokens(page)
     if tokens:
