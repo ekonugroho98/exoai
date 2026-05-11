@@ -133,17 +133,16 @@ async def do_login(page) -> None:
         err(f"Password field not found (2FA required? wrong credentials?): {e}")
         return
 
-    # Handle Google "Welcome to your new account" / "I understand" interstitial
-    prog("Checking for account confirmation page...")
-    for _ in range(10):
-        try:
-            btn = page.locator("button:has-text('I understand'), input[value='I understand']").first
-            if await btn.is_visible(timeout=1500):
-                prog("Clicking 'I understand'...")
-                await btn.click()
-                await page.wait_for_timeout(1500)
-        except Exception:
-            break
+    # Handle Google "Welcome to your new account" / "I understand" interstitial.
+    # Only present for new/Workspace accounts — silently skip if not found.
+    try:
+        btn = page.locator("button:has-text('I understand'), input[value='I understand']").first
+        if await btn.is_visible(timeout=2000):
+            prog("Clicking 'I understand'...")
+            await btn.click()
+            await page.wait_for_timeout(1000)
+    except Exception:
+        pass  # Not present — normal for existing/personal accounts
 
     # Wait for redirect back to moclaw.ai
     prog("Waiting for redirect to moclaw.ai...")
