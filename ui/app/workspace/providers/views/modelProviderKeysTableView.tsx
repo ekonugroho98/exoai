@@ -19,9 +19,10 @@ import { useDeleteProviderKeyMutation, useGetProviderKeysQuery, useUpdateProvide
 import { ModelProvider } from "@/lib/types/config";
 import { cn } from "@/lib/utils";
 import { RbacOperation, RbacResource, useRbac } from "@enterprise/lib";
-import { AlertCircle, CheckCircle2, EllipsisIcon, PencilIcon, PlusIcon, TrashIcon } from "lucide-react";
+import { AlertCircle, CheckCircle2, EllipsisIcon, PencilIcon, PlusIcon, TrashIcon, UploadIcon } from "lucide-react";
 import { ReactNode, useState } from "react";
 import { toast } from "sonner";
+import AddMoClawAccountsDialog from "../dialogs/addMoClawAccountsDialog";
 import AddNewKeySheet from "../dialogs/addNewKeySheet";
 
 interface Props {
@@ -47,6 +48,7 @@ export default function ModelProviderKeysTableView({ provider, className, header
 	const [togglingKeyIds, setTogglingKeyIds] = useState<Set<string>>(new Set());
 	const [showAddNewKeyDialog, setShowAddNewKeyDialog] = useState<{ show: boolean; keyId: string | null } | undefined>(undefined);
 	const [showDeleteKeyDialog, setShowDeleteKeyDialog] = useState<{ show: boolean; keyId: string } | undefined>(undefined);
+	const [showMoClawImportDialog, setShowMoClawImportDialog] = useState(false);
 
 	function handleAddKey() {
 		setShowAddNewKeyDialog({ show: true, keyId: null });
@@ -92,6 +94,12 @@ export default function ModelProviderKeysTableView({ provider, className, header
 					</AlertDialogContent>
 				</AlertDialog>
 			)}
+			{providerName === 'moclaw' && (
+				<AddMoClawAccountsDialog
+					open={showMoClawImportDialog}
+					onClose={() => setShowMoClawImportDialog(false)}
+				/>
+			)}
 			{showAddNewKeyDialog && (
 				<AddNewKeySheet
 					show={showAddNewKeyDialog.show}
@@ -106,6 +114,16 @@ export default function ModelProviderKeysTableView({ provider, className, header
 					<div className="flex items-center gap-2">Configured {entityLabelPlural}</div>
 					<div className="flex items-center gap-2">
 						{headerActions}
+						{!isKeyless && providerName === "moclaw" && (
+							<Button
+								variant="outline"
+								disabled={!hasUpdateProviderAccess}
+								onClick={() => setShowMoClawImportDialog(true)}
+							>
+								<UploadIcon className="h-4 w-4" />
+								Import Accounts
+							</Button>
+						)}
 						{!isKeyless && (
 							<Button
 								disabled={!hasUpdateProviderAccess}

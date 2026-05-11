@@ -123,6 +123,8 @@ func (h *ProviderHandler) RegisterRoutes(r *router.Router, middlewares ...schema
 	r.PUT("/api/providers/{provider}/keys/{key_id}", lib.ChainMiddlewares(h.updateProviderKey, middlewares...))
 	r.DELETE("/api/providers/{provider}", lib.ChainMiddlewares(h.deleteProvider, middlewares...))
 	r.DELETE("/api/providers/{provider}/keys/{key_id}", lib.ChainMiddlewares(h.deleteProviderKey, middlewares...))
+	// MoClaw-specific: auto-login via Auth0 ROPC
+	r.POST("/api/providers/moclaw/login", lib.ChainMiddlewares(h.moclawLogin, middlewares...))
 	r.GET("/api/keys", lib.ChainMiddlewares(h.listKeys, middlewares...))
 	r.GET("/api/models", lib.ChainMiddlewares(h.listModels, middlewares...))
 	r.GET("/api/models/details", lib.ChainMiddlewares(h.listModelDetails, middlewares...))

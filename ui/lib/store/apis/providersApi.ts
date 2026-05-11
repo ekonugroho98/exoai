@@ -333,6 +333,14 @@ export const providersApi = baseApi.injectEndpoints({
 
 		// Get model parameters (parameters, capabilities) from local API
 		// Falls back to default parameters if the API returns an error (e.g. model not found)
+		moclawLogin: builder.mutation<{ email: string; access_token: string; refresh_token: string; expires_in: number }, { email: string; password: string }>({
+			query: ({ email, password }) => ({
+				url: '/providers/moclaw/login',
+				method: 'POST',
+				body: { email, password },
+			}),
+		}),
+
 		getModelParameters: builder.query<ModelDatasheetResponse, string>({
 			queryFn: async (model, _queryApi, _extraOptions, baseQuery) => {
 				const result = await baseQuery(`/models/parameters?model=${encodeURIComponent(model)}`);
@@ -372,4 +380,5 @@ export const {
 	useLazyGetBaseModelsQuery,
 	useGetModelParametersQuery,
 	useLazyGetModelParametersQuery,
+	useMoclawLoginMutation,
 } = providersApi;
