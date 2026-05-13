@@ -49,6 +49,7 @@ export const ModelPlaceholders = {
 	vllm: "e.g. Qwen/Qwen3-0.6B, Qwen/Qwen3-1.5B",
 	runway: "e.g. gen4_turbo_image_to_video, gen3a_turbo_image_to_video",
 	fireworks: "e.g. accounts/fireworks/models/deepseek-v3p2",
+	codex: "e.g. gpt-5-codex, gpt-5.4-codex",
 	"zai-web": "e.g. GLM-5.1, GLM-5",
 	moclaw: "e.g. claude-opus-4-6, claude-sonnet-4-6, deepseek-v4-pro",
 };
@@ -77,6 +78,7 @@ export const isKeyRequiredByProvider: Record<ProviderName, boolean> = {
 	runway: true,
 	vllm: false,
 	fireworks: true,
+	codex: true,
 	"zai-web": true,
 	moclaw: true,
 };

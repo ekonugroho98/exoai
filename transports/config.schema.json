@@ -334,6 +334,9 @@
         "fireworks": {
           "$ref": "#/$defs/provider"
         },
+        "codex": {
+          "$ref": "#/$defs/provider"
+        },
         "nebius": {
           "$ref": "#/$defs/provider"
         },
@@ -4152,7 +4155,8 @@
             "replicate",
             "vllm",
             "runway",
-            "fireworks"
+            "fireworks",
+            "codex"
           ],
           "description": "Base provider type to extend"
         },

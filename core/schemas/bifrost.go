@@ -58,6 +58,7 @@ const (
 	VLLM        ModelProvider = "vllm"
 	Runway      ModelProvider = "runway"
 	Fireworks   ModelProvider = "fireworks"
+	Codex       ModelProvider = "codex"
 	ZaiWeb      ModelProvider = "zai-web"
 	MoClaw      ModelProvider = "moclaw"
 )
@@ -98,6 +99,9 @@ var StandardProviders = []ModelProvider{
 	VLLM,
 	Runway,
 	Fireworks,
+	Codex,
+	ZaiWeb,
+	MoClaw,
 }
 
 // RequestType represents the type of request being made to a provider.

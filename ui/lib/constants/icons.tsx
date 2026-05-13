@@ -775,6 +775,29 @@ export const ProviderIcons = {
       </svg>
     );
   },
+  codex: ({ size = "md", className = "" }: IconProps) => {
+    const resolvedSize = resolveSize(size);
+    return (
+      <svg
+        width={resolvedSize}
+        height={resolvedSize}
+        viewBox="0 0 128 128"
+        fill="none"
+        xmlns="http://www.w3.org/2000/svg"
+        className={className}
+      >
+        <title>Codex</title>
+        <rect x="8" y="8" width="112" height="112" rx="24" fill="#111827" />
+        <path
+          d="M42 43L22 64L42 85M86 43L106 64L86 85M73 32L55 96"
+          stroke="#FFFFFF"
+          strokeWidth="9"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+      </svg>
+    );
+  },
   moclaw: ({ size = "md", className = "" }: IconProps) => {
     const resolvedSize = resolveSize(size);
     return (

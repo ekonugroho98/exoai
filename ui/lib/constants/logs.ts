@@ -23,6 +23,7 @@ export const KnownProvidersNames = [
 	"vllm",
 	"runway",
 	"fireworks",
+	"codex",
 	"zai-web",
 	"moclaw",
 ] as const;
@@ -105,6 +106,7 @@ export const ProviderLabels: Record<ProviderName, string> = {
 	vllm: "vLLM",
 	runway: "Runway",
 	fireworks: "Fireworks AI",
+	codex: "Codex",
 	"zai-web": "Z.ai Web",
 	moclaw: "MoClaw",
 } as const;
