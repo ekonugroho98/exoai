@@ -31,6 +31,7 @@ import (
 	"github.com/maximhq/bifrost/core/providers/groq"
 	"github.com/maximhq/bifrost/core/providers/huggingface"
 	"github.com/maximhq/bifrost/core/providers/mistral"
+	"github.com/maximhq/bifrost/core/providers/moclaw"
 	"github.com/maximhq/bifrost/core/providers/nebius"
 	"github.com/maximhq/bifrost/core/providers/ollama"
 	"github.com/maximhq/bifrost/core/providers/openai"
@@ -44,6 +45,7 @@ import (
 	"github.com/maximhq/bifrost/core/providers/vertex"
 	"github.com/maximhq/bifrost/core/providers/vllm"
 	"github.com/maximhq/bifrost/core/providers/xai"
+	"github.com/maximhq/bifrost/core/providers/zaiweb"
 	schemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/valyala/fasthttp"
 )
@@ -4005,6 +4007,10 @@ func (bifrost *Bifrost) createBaseProvider(providerKey schemas.ModelProvider, co
 		return runway.NewRunwayProvider(config, bifrost.logger)
 	case schemas.Fireworks:
 		return fireworks.NewFireworksProvider(config, bifrost.logger)
+	case schemas.ZaiWeb:
+		return zaiweb.NewZaiWebProvider(config, bifrost.logger)
+	case schemas.MoClaw:
+		return moclaw.NewMoClawProvider(config, bifrost.logger)
 	default:
 		return nil, fmt.Errorf("unsupported provider: %s", targetProviderKey)
 	}
@@ -5538,11 +5544,16 @@ func executeRequestWithRetries[T any](
 
 		// Check if we should retry based on status code or error message
 		shouldRetry := false
+		// Treat both rate-limit (429) and auth errors (401) as key-rotation triggers.
+		// 401 means this specific key's credentials are invalid — rotating to
+		// another key may succeed (e.g. moclaw multi-account with stale tokens).
+		isKeyRotatable := bifrostError.StatusCode != nil && *bifrostError.StatusCode == 401
 		isRateLimit := (bifrostError.StatusCode != nil && *bifrostError.StatusCode == 429) ||
 			(bifrostError.Error != nil &&
 				(IsRateLimitErrorMessage(bifrostError.Error.Message) ||
 					(bifrostError.Error.Type != nil && IsRateLimitErrorMessage(*bifrostError.Error.Type)) ||
 					(bifrostError.Error.Code != nil && IsRateLimitErrorMessage(*bifrostError.Error.Code))))
+		isRateLimit = isRateLimit || isKeyRotatable
 
 		errMessage := GetErrorMessage(bifrostError)
 

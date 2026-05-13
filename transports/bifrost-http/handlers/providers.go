@@ -127,6 +127,7 @@ func (h *ProviderHandler) RegisterRoutes(r *router.Router, middlewares ...schema
 	r.POST("/api/providers/moclaw/login", lib.ChainMiddlewares(h.moclawLogin, middlewares...))
 	r.POST("/api/providers/moclaw/browser-login", lib.ChainMiddlewares(h.moclawBrowserLoginStart, middlewares...))
 	r.GET("/api/providers/moclaw/browser-login/{session_id}", lib.ChainMiddlewares(h.moclawBrowserLoginStatus, middlewares...))
+	r.POST("/api/providers/moclaw/check-balance", lib.ChainMiddlewares(h.moclawCheckBalance, middlewares...))
 	r.GET("/api/keys", lib.ChainMiddlewares(h.listKeys, middlewares...))
 	r.GET("/api/models", lib.ChainMiddlewares(h.listModels, middlewares...))
 	r.GET("/api/models/details", lib.ChainMiddlewares(h.listModelDetails, middlewares...))

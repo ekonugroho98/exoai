@@ -1,0 +1,425 @@
+---
+title: "Z.ai Web (zai-web)"
+description: "Use chat.z.ai's reverse-engineered web API as an OpenAI-compatible provider through Bifrost. Includes thinking mode, streaming, and token usage."
+icon: "brain"
+---
+
+<Warning>
+**For learning and personal experimentation only.**
+
+`zai-web` proxies to the chat.z.ai web frontend, not Z.ai's official API.
+This means:
+
+- Authentication uses a session token harvested from a logged-in browser
+  (not an official API key).
+- Token has a server-side TTL — expects to be refreshed periodically.
+- Heavy or commercial use violates Z.ai's Terms of Service.
+- Z.ai may break this integration anytime by changing their web API.
+
+For production workloads use Z.ai's **official API** at `api.z.ai` /
+`open.bigmodel.cn` instead — Bifrost supports it via the standard OpenAI
+provider with a custom base URL.
+</Warning>
+
+## Overview
+
+The `zai-web` provider exposes the GLM family (GLM-5.1, GLM-5) of models behind
+an OpenAI-compatible endpoint. It's useful for:
+
+- Trying GLM models without registering for an API key.
+- Building tools/agents that need a fast OpenAI-compatible drop-in.
+- Studying how Bifrost's provider abstraction works (the source code is small
+  and self-contained at `core/providers/zaiweb/`).
+
+What it supports:
+
+| Capability | Status |
+|---|---|
+| Chat completions (streaming + non-streaming) | ✅ |
+| Multi-turn conversation | ✅ |
+| Token usage reporting | ✅ |
+| Reasoning / thinking mode | ✅ (mapped to `delta.reasoning`) |
+| Bifrost fallbacks, rate limit, observability | ✅ (free, gateway handles) |
+| Tool / function calling | ❌ (not exposed by web endpoint) |
+| Vision / image input | ❌ |
+| Embeddings, image gen, speech, etc. | ❌ |
+
+## Step 1 — Get a session token
+
+1. Open <a href="https://chat.z.ai">chat.z.ai</a> in Chrome and log in.
+2. Open DevTools (`F12`) → **Application** → **Storage** → **Cookies** → `https://chat.z.ai`.
+3. Find the cookie named `token`. Copy its **Value** (a long JWT starting with `eyJ...`).
+
+The token is opaque to you — never paste it into code or screenshots.
+Store it as an environment variable:
+
+```bash
+export ZAI_TOKEN='eyJhbGc...PASTE_HERE'
+```
+
+<Note>
+Tokens have a server-side TTL. When you start getting `401 Unauthorized`,
+log back in to chat.z.ai and copy a fresh token.
+</Note>
+
+## Step 2 — Configure the provider in Bifrost
+
+<Tabs group="provider-config">
+
+<Tab title="Using Web UI">
+
+1. Open `http://localhost:8080/workspace/providers`.
+2. Click **Add Provider**.
+3. Select **Z.ai Web** from the dropdown.
+4. Fill the form:
+   - **API Key** — paste the JWT (no `Bearer ` prefix).
+   - **Model** — `GLM-5.1` (or `GLM-5`).
+   - **Base URL** — leave blank (defaults to `https://chat.z.ai`).
+5. Save.
+
+</Tab>
+
+<Tab title="Using API">
+
+```bash
+curl --location 'http://localhost:8080/api/providers' \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "provider": "zai-web",
+    "keys": [{
+      "name": "zai-web-key-1",
+      "value": "env.ZAI_TOKEN",
+      "models": ["GLM-5.1", "GLM-5"],
+      "weight": 1.0
+    }]
+  }'
+```
+
+Set `ZAI_TOKEN` in the environment Bifrost runs in.
+
+For multiple tokens (rotation / load balancing), add more entries to `keys` —
+Bifrost will distribute requests by `weight`.
+
+</Tab>
+
+</Tabs>
+
+## Step 3 — Make your first call
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "zai-web/GLM-5.1",
+    "messages": [{"role":"user","content":"Hello!"}],
+    "stream": true
+  }'
+```
+
+You should see streaming chunks in OpenAI format:
+
+```
+data: {"id":"chatcmpl-...","choices":[{"index":0,"delta":{"content":"Hi"}}],...}
+data: {"id":"chatcmpl-...","choices":[{"index":0,"delta":{"content":" there!"}}],...}
+data: {"id":"chatcmpl-...","choices":[{"index":0,"finish_reason":"stop","delta":{}}],...}
+data: [DONE]
+```
+
+## Reasoning / thinking mode
+
+GLM models support an internal chain-of-thought ("thinking") that the adapter
+maps to OpenAI's `delta.reasoning` field — the same convention used by
+o1/o3/DeepSeek-R1. You can enable it in three equivalent ways:
+
+<Tabs group="thinking-syntax">
+
+<Tab title="reasoning_effort">
+
+The o1-style top-level field. Recommended for compatibility with most
+OpenAI-aware tools.
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "zai-web/GLM-5.1",
+    "messages": [{"role":"user","content":"What is 17 * 23?"}],
+    "stream": true,
+    "reasoning_effort": "medium"
+  }'
+```
+
+Effort values: `low`, `medium`, `high`. The adapter treats anything other than
+`none` as enabling thinking — GLM doesn't have granular effort levels itself.
+
+</Tab>
+
+<Tab title="reasoning object">
+
+The Anthropic / OpenRouter style.
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "zai-web/GLM-5.1",
+    "messages": [{"role":"user","content":"What is 17 * 23?"}],
+    "stream": true,
+    "reasoning": {"enabled": true}
+  }'
+```
+
+</Tab>
+
+<Tab title="enable_thinking">
+
+Bifrost-specific escape hatch via top-level extra param. Useful when your
+client doesn't speak the reasoning fields.
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "zai-web/GLM-5.1",
+    "messages": [{"role":"user","content":"What is 17 * 23?"}],
+    "stream": true,
+    "enable_thinking": true
+  }'
+```
+
+Place `enable_thinking` at the top level of the request body — not nested
+inside `params`. Bifrost's compat layer auto-routes unknown top-level fields
+into `Params.ExtraParams` for the adapter to read.
+
+</Tab>
+
+</Tabs>
+
+When thinking is on, you'll see `delta.reasoning` chunks before the regular
+`delta.content` chunks:
+
+```json
+data: {"choices":[{"delta":{"reasoning":"Let me calculate 17 * 23..."}}],...}
+data: {"choices":[{"delta":{"reasoning":" = (20-3)(20+3)..."}}],...}
+data: {"choices":[{"delta":{"reasoning":" = 400 - 9 = 391"}}],...}
+data: {"choices":[{"delta":{"content":"17 * 23 = 391"}}],...}
+data: {"choices":[{"finish_reason":"stop","delta":{}}],...}
+data: [DONE]
+```
+
+<Note>
+GLM's reasoning content is wrapped in HTML-like markers
+(`<details type="reasoning">` and markdown blockquotes `> `). This is GLM's
+internal format for renderable collapsible thinking sections; most clients
+display it fine, but if you need clean text, strip those markers in your
+client.
+</Note>
+
+## Client SDK examples
+
+<Tabs group="client-sdk">
+
+<Tab title="Python (OpenAI SDK)">
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8080/v1",
+    api_key="dummy",  # Bifrost handles auth — any string works
+)
+
+# Non-streaming
+resp = client.chat.completions.create(
+    model="zai-web/GLM-5.1",
+    messages=[{"role": "user", "content": "What is 7 * 9?"}],
+)
+print(resp.choices[0].message.content)
+print(f"Tokens: {resp.usage.total_tokens}")
+
+# Streaming with thinking
+stream = client.chat.completions.create(
+    model="zai-web/GLM-5.1",
+    messages=[{"role": "user", "content": "Plan a 3-day Bali trip."}],
+    reasoning_effort="medium",
+    stream=True,
+)
+for chunk in stream:
+    delta = chunk.choices[0].delta
+    if hasattr(delta, "reasoning") and delta.reasoning:
+        print(f"\033[90m{delta.reasoning}\033[0m", end="", flush=True)  # gray
+    if delta.content:
+        print(delta.content, end="", flush=True)
+```
+
+</Tab>
+
+<Tab title="Node.js (OpenAI SDK)">
+
+```javascript
+import OpenAI from "openai";
+
+const client = new OpenAI({
+  baseURL: "http://localhost:8080/v1",
+  apiKey: "dummy",
+});
+
+// Streaming with thinking
+const stream = await client.chat.completions.create({
+  model: "zai-web/GLM-5.1",
+  messages: [{ role: "user", content: "What is 17 * 23?" }],
+  reasoning_effort: "medium",
+  stream: true,
+});
+
+for await (const chunk of stream) {
+  const delta = chunk.choices[0]?.delta;
+  if (delta?.reasoning) process.stdout.write(`\x1b[90m${delta.reasoning}\x1b[0m`);
+  if (delta?.content) process.stdout.write(delta.content);
+}
+```
+
+</Tab>
+
+<Tab title="Cline / Continue (VSCode)">
+
+In Cline / Continue settings, point to the Bifrost gateway as an
+**OpenAI-Compatible** provider:
+
+- **API Base URL:** `http://localhost:8080/v1`
+- **API Key:** any non-empty string (Bifrost handles upstream auth)
+- **Model:** `zai-web/GLM-5.1`
+
+Both extensions will automatically use streaming and respect
+`reasoning_effort` / `delta.reasoning` for thinking display.
+
+</Tab>
+
+<Tab title="curl (multi-turn)">
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "zai-web/GLM-5.1",
+    "messages": [
+      {"role":"user","content":"My name is Eko."},
+      {"role":"assistant","content":"Hi Eko!"},
+      {"role":"user","content":"What is my name?"}
+    ],
+    "stream": false
+  }'
+```
+
+</Tab>
+
+</Tabs>
+
+## Models
+
+The web endpoint exposes the same GLM models you see in the chat.z.ai UI's
+model selector:
+
+| Model | Notes |
+|---|---|
+| `GLM-5.1` | Default flagship model. Supports `enable_thinking`. |
+| `GLM-5` | Earlier generation. |
+
+When making requests through Bifrost, prefix the model with the provider name:
+`zai-web/GLM-5.1`, `zai-web/GLM-5`. Bifrost uses this prefix to route to the
+correct provider.
+
+## Limitations
+
+| Feature | Status | Reason |
+|---|---|---|
+| Tool / function calling | ❌ | Not exposed by web endpoint |
+| Vision (image input) | ❌ | Web endpoint expects text only in `messages` |
+| Custom system message | ⚠️  Partial | Sent as `role: "system"` in messages; effectiveness depends on GLM |
+| Custom temperature / top_p | ⚠️  Ignored | Web endpoint hardcodes generation params |
+| Stop sequences | ❌ | Not respected by web endpoint |
+| Embeddings | ❌ | Web endpoint is chat-only |
+| Image / video / speech | ❌ | Web endpoint is chat-only |
+| `stream: false` | ✅ | Adapter aggregates SSE → single response |
+
+The non-supported operations return `BifrostError` with code
+`unsupported_operation` so Bifrost's fallback mechanism can route to a
+different provider gracefully.
+
+## Troubleshooting
+
+### `401 Unauthorized`
+
+The session token has expired or been revoked.
+
+1. Log back in to chat.z.ai in Chrome.
+2. Copy the new `token` cookie value.
+3. Update the API Key in Bifrost UI under
+   `Providers → Z.ai Web → Edit → API Key`.
+
+### `426 Your client version (unknown) is outdated`
+
+The `X-FE-Version` header is missing. The adapter sends `prod-fe-1.1.22` by
+default; if you've overridden it via `ExtraHeaders`, make sure the value
+parses as a valid semver (>= 1.0.0).
+
+### Empty / very short response
+
+GLM occasionally produces terse answers, especially when the user prompt
+already contains the data the model needs. Adding `Show your reasoning.` or
+similar to the user prompt usually triggers more verbose output, especially
+in combination with `reasoning_effort: "high"`.
+
+### Thinking content has `<details>` and `> ` markers
+
+This is GLM's native format for renderable collapsible thinking. To strip:
+
+```python
+import re
+
+def clean_reasoning(text: str) -> str:
+    text = re.sub(r"<details[^>]*>", "", text)
+    text = text.replace("</details>", "")
+    text = re.sub(r"^>\s?", "", text, flags=re.MULTILINE)
+    return text.strip()
+```
+
+### Rate limited
+
+Z.ai web endpoint enforces per-account limits. To distribute load:
+
+1. Create multiple Z.ai accounts.
+2. Add multiple keys to the provider config in Bifrost (one per account).
+3. Bifrost's `keyselectors` will distribute requests by `weight`.
+
+This is **not recommended for commercial use** — see the warning at the top.
+
+## How it works (under the hood)
+
+The adapter lives at `core/providers/zaiweb/zaiweb.go`. Three steps per
+request:
+
+1. **Translate request:** OpenAI-format `BifrostChatRequest` →
+   minimal Z.ai web body
+   `{stream, model, messages, features.enable_thinking?}`.
+2. **Send & stream:** POST to `https://chat.z.ai/api/v2/chat/completions` with
+   the bearer token + `X-FE-Version` header. Server responds with custom SSE.
+3. **Translate response:** Each Z.ai SSE chunk
+   `{type:"chat:completion", data:{phase, ...}}` is converted to
+   OpenAI-format `BifrostChatResponse`:
+   - `phase: "thinking"` → `delta.reasoning`
+   - `phase: "answer"` → `delta.content`
+   - `phase: "other"` + `usage` → chunk with `usage` populated
+   - `phase: "other"` + `edit_index` / `edit_content` → emitted as a delta
+     content chunk (OpenAI streaming has no rewind primitive)
+   - `phase: "done"` → final chunk with `finish_reason: "stop"`, plus
+     `data: [DONE]` marker
+
+The adapter exposes only `ChatCompletion` and `ChatCompletionStream`; all
+other Provider methods stub out as `UnsupportedOperationError`.
+
+## See also
+
+- [Provider Configuration](/quickstart/gateway/provider-configuration) — multi-provider setup, fallbacks, load balancing.
+- [Streaming](/quickstart/gateway/streaming) — how Bifrost's streaming SSE works under the hood.
+- [Source code](https://github.com/maximhq/bifrost/tree/main/core/providers/zaiweb) — small (~600 LOC) and self-contained, good reference for writing your own adapter.

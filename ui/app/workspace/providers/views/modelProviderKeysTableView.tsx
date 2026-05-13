@@ -15,12 +15,12 @@ import { Switch } from "@/components/ui/switch";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { getErrorMessage } from "@/lib/store";
-import { useDeleteProviderKeyMutation, useGetProviderKeysQuery, useUpdateProviderKeyMutation } from "@/lib/store/apis/providersApi";
+import { useDeleteProviderKeyMutation, useGetProviderKeysQuery, useMoclawCheckBalanceMutation, useUpdateProviderKeyMutation } from "@/lib/store/apis/providersApi";
 import { ModelProvider } from "@/lib/types/config";
 import { cn } from "@/lib/utils";
 import { RbacOperation, RbacResource, useRbac } from "@enterprise/lib";
-import { AlertCircle, CheckCircle2, EllipsisIcon, PencilIcon, PlusIcon, TrashIcon, UploadIcon } from "lucide-react";
-import { ReactNode, useState } from "react";
+import { AlertCircle, CheckCircle2, EllipsisIcon, Loader2, PencilIcon, PlusIcon, TrashIcon, UploadIcon } from "lucide-react";
+import { ReactNode, useEffect, useState } from "react";
 import { toast } from "sonner";
 import AddMoClawAccountsDialog from "../dialogs/addMoClawAccountsDialog";
 import AddNewKeySheet from "../dialogs/addNewKeySheet";
@@ -30,6 +30,33 @@ interface Props {
 	provider: ModelProvider;
 	headerActions?: ReactNode;
 	isKeyless?: boolean;
+}
+
+function MoclawCreditsCell({ token, keyId }: { token: string; keyId: string }) {
+	const [checkBalance, { data, isLoading, isUninitialized, isError }] = useMoclawCheckBalanceMutation();
+
+	useEffect(() => {
+		if (token && !token.startsWith("env:")) {
+			checkBalance({ token, key_id: keyId });
+		}
+	}, [token, keyId, checkBalance]);
+
+	if (!token || token.startsWith("env:")) return <span className="text-muted-foreground text-xs">—</span>;
+	if (isUninitialized || isLoading) return <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />;
+	if (isError || !data) return <span className="text-muted-foreground text-xs">—</span>;
+
+	const balance = data.total_balance;
+	const colorClass = balance >= 500 ? "text-green-600" : balance > 0 ? "text-yellow-600" : "text-muted-foreground";
+	return (
+		<Tooltip>
+			<TooltipTrigger asChild>
+				<span className={cn("font-mono text-sm cursor-default", colorClass)}>
+					{balance.toLocaleString()}
+				</span>
+			</TooltipTrigger>
+			<TooltipContent>{data.plan?.display_name ?? "Unknown plan"}</TooltipContent>
+		</Tooltip>
+	);
 }
 
 export default function ModelProviderKeysTableView({ provider, className, headerActions, isKeyless }: Props) {
@@ -151,6 +178,7 @@ export default function ModelProviderKeysTableView({ provider, className, header
 							<TableRow>
 								<TableHead>{isVLLM ? "Model" : isOllamaOrSGL ? "Server" : "API Key"}</TableHead>
 								<TableHead>Weight</TableHead>
+								{providerName === "moclaw" && <TableHead>Credits</TableHead>}
 								<TableHead>Enabled</TableHead>
 								<TableHead className="text-right"></TableHead>
 							</TableRow>
@@ -244,6 +272,11 @@ export default function ModelProviderKeysTableView({ provider, className, header
 												<span className="font-mono text-sm">{key.weight}</span>
 											</div>
 										</TableCell>
+										{providerName === "moclaw" && (
+											<TableCell>
+												<MoclawCreditsCell token={key.value?.value ?? ""} keyId={key.id} />
+											</TableCell>
+										)}
 										<TableCell>
 											<Switch
 												data-testid="key-enabled-switch"

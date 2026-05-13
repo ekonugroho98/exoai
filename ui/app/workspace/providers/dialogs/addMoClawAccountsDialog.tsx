@@ -15,7 +15,7 @@ import {
 	useCreateProviderKeyMutation,
 	useMoclawBrowserLoginStartMutation,
 } from "@/lib/store/apis/providersApi";
-import { CheckCircle2, KeyIcon, Loader2, MonitorSmartphone, XCircle } from "lucide-react";
+import { CheckCircle2, KeyIcon, Loader2, MonitorSmartphone, RotateCcw, XCircle } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { v4 as uuid } from "uuid";
@@ -48,9 +48,10 @@ export default function AddMoClawAccountsDialog({ open, onClose }: Props) {
 	// ── Browser-login state ───────────────────────────────────────────────────
 	const [browserText, setBrowserText] = useState("");
 	const [headless, setHeadless] = useState(false);
+	const [parallelCount, setParallelCount] = useState(1);
 	const [isRunning, setIsRunning] = useState(false);
 	const [results, setResults] = useState<AccountResult[]>([]);
-	const evtSourceRef = useRef<EventSource | null>(null);
+	const evtSourcesRef = useRef<Map<number, EventSource>>(new Map());
 	const abortRef = useRef(false);
 
 	// ── API hooks ─────────────────────────────────────────────────────────────
@@ -58,15 +59,15 @@ export default function AddMoClawAccountsDialog({ open, onClose }: Props) {
 	const [createProviderKey] = useCreateProviderKeyMutation();
 
 	// ── Cleanup ───────────────────────────────────────────────────────────────
-	const stopEventSource = useCallback(() => {
-		evtSourceRef.current?.close();
-		evtSourceRef.current = null;
+	const stopAllEventSources = useCallback(() => {
+		evtSourcesRef.current.forEach((es) => es.close());
+		evtSourcesRef.current.clear();
 	}, []);
 
 	useEffect(() => {
 		if (!open) {
 			abortRef.current = true;
-			stopEventSource();
+			stopAllEventSources();
 			setStep("choose");
 			setManualText("");
 			setBrowserText("");
@@ -74,8 +75,8 @@ export default function AddMoClawAccountsDialog({ open, onClose }: Props) {
 			setResults([]);
 			setIsRunning(false);
 		}
-		return () => stopEventSource();
-	}, [open, stopEventSource]);
+		return () => stopAllEventSources();
+	}, [open, stopAllEventSources]);
 
 	// ── Helpers ───────────────────────────────────────────────────────────────
 	async function createKey(name: string, tokenValue: string) {
@@ -136,11 +137,12 @@ export default function AddMoClawAccountsDialog({ open, onClose }: Props) {
 
 		return new Promise<boolean>((resolve) => {
 			const es = new EventSource(`/api/providers/moclaw/browser-login/${sessionId}`);
-			evtSourceRef.current = es;
+			evtSourcesRef.current.set(index, es);
 
 			es.addEventListener("status", async (e) => {
 				if (abortRef.current) {
 					es.close();
+					evtSourcesRef.current.delete(index);
 					resolve(false);
 					return;
 				}
@@ -148,7 +150,7 @@ export default function AddMoClawAccountsDialog({ open, onClose }: Props) {
 					const evt = JSON.parse((e as MessageEvent).data);
 					if (evt.status === "done") {
 						es.close();
-						evtSourceRef.current = null;
+						evtSourcesRef.current.delete(index);
 						const token = evt.refresh_token || evt.access_token || "";
 						try {
 							await createKey(account.email || `moclaw-account-${index + 1}`, token);
@@ -160,7 +162,7 @@ export default function AddMoClawAccountsDialog({ open, onClose }: Props) {
 						}
 					} else if (evt.status === "error") {
 						es.close();
-						evtSourceRef.current = null;
+						evtSourcesRef.current.delete(index);
 						setResult(index, { status: "error", error: evt.error || "Login failed" });
 						resolve(false);
 					} else {
@@ -173,14 +175,14 @@ export default function AddMoClawAccountsDialog({ open, onClose }: Props) {
 
 			es.onerror = () => {
 				es.close();
-				evtSourceRef.current = null;
+				evtSourcesRef.current.delete(index);
 				setResult(index, { status: "error", error: "Connection to server lost" });
 				resolve(false);
 			};
 		});
 	}
 
-	// ── Start all sessions sequentially ───────────────────────────────────────
+	// ── Start all sessions (sequential or parallel batches) ───────────────────
 	async function handleBrowserLoginAll() {
 		const accounts = parseBrowserAccounts();
 		if (!accounts.length) return;
@@ -190,16 +192,37 @@ export default function AddMoClawAccountsDialog({ open, onClose }: Props) {
 		setResults(accounts.map(() => ({ status: "pending" as const })));
 
 		let successCount = 0;
-		for (let i = 0; i < accounts.length; i++) {
+		const batchSize = parallelCount;
+
+		for (let i = 0; i < accounts.length; i += batchSize) {
 			if (abortRef.current) break;
-			const ok = await runOneSession(i, accounts[i]);
-			if (ok) successCount++;
+			const batch = accounts.slice(i, i + batchSize);
+			const results = await Promise.all(
+				batch.map((account, j) => runOneSession(i + j, account))
+			);
+			successCount += results.filter(Boolean).length;
 		}
 
 		setIsRunning(false);
 		if (successCount > 0) {
 			toast.success(`${successCount} of ${accounts.length} account${accounts.length > 1 ? "s" : ""} added`);
 		}
+	}
+
+	// ── Retry a single failed account ─────────────────────────────────────────
+	const [retryingIndices, setRetryingIndices] = useState<Set<number>>(new Set());
+
+	async function retryAccount(index: number) {
+		const account = browserAccounts[index];
+		if (!account) return;
+		setRetryingIndices((prev) => new Set(prev).add(index));
+		abortRef.current = false;
+		await runOneSession(index, account);
+		setRetryingIndices((prev) => {
+			const next = new Set(prev);
+			next.delete(index);
+			return next;
+		});
 	}
 
 	// ── Manual login ──────────────────────────────────────────────────────────
@@ -335,6 +358,32 @@ export default function AddMoClawAccountsDialog({ open, onClose }: Props) {
 									<Switch checked={headless} onCheckedChange={setHeadless} />
 								</div>
 
+								{/* Parallel count */}
+								<div className="flex items-center justify-between rounded-lg border px-4 py-3">
+									<div>
+										<p className="text-sm font-medium">Parallel sessions</p>
+										<p className="text-muted-foreground text-xs mt-0.5">
+											Run multiple logins at the same time (max 5)
+										</p>
+									</div>
+									<div className="flex gap-1">
+										{[1, 2, 3, 4, 5].map((n) => (
+											<button
+												key={n}
+												type="button"
+												onClick={() => setParallelCount(n)}
+												className={`h-7 w-7 rounded text-xs font-medium transition-colors ${
+													parallelCount === n
+														? "bg-primary text-primary-foreground"
+														: "bg-muted text-muted-foreground hover:bg-muted/70"
+												}`}
+											>
+												{n}
+											</button>
+										))}
+									</div>
+								</div>
+
 								<div className="text-muted-foreground rounded-lg border p-3 text-xs space-y-1">
 									<p className="font-medium text-foreground text-sm mb-1">Requirements</p>
 									<p>• Python 3 must be installed</p>
@@ -365,7 +414,20 @@ export default function AddMoClawAccountsDialog({ open, onClose }: Props) {
 											<span className="text-muted-foreground text-xs truncate">{r.message}</span>
 										)}
 										{r.status === "error" && (
-											<span className="text-destructive text-xs truncate">{r.error}</span>
+											<span className="text-destructive text-xs truncate flex-1">{r.error}</span>
+										)}
+										{r.status === "error" && !isRunning && (
+											<button
+												type="button"
+												onClick={() => retryAccount(i)}
+												disabled={retryingIndices.has(i)}
+												className="ml-auto shrink-0 text-muted-foreground hover:text-foreground disabled:opacity-50"
+												title="Retry"
+											>
+												{retryingIndices.has(i)
+													? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+													: <RotateCcw className="h-3.5 w-3.5" />}
+											</button>
 										)}
 										{r.status === "done" && (
 											<span className="text-green-600 text-xs">Saved ✓</span>
@@ -447,7 +509,7 @@ export default function AddMoClawAccountsDialog({ open, onClose }: Props) {
 								variant="outline"
 								onClick={() => {
 									abortRef.current = true;
-									stopEventSource();
+									stopAllEventSources();
 									setIsRunning(false);
 									setResults([]);
 									setStep("choose");
@@ -464,7 +526,7 @@ export default function AddMoClawAccountsDialog({ open, onClose }: Props) {
 									variant="destructive"
 									onClick={() => {
 										abortRef.current = true;
-										stopEventSource();
+										stopAllEventSources();
 										setIsRunning(false);
 									}}
 								>

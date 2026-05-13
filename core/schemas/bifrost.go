@@ -58,6 +58,8 @@ const (
 	VLLM        ModelProvider = "vllm"
 	Runway      ModelProvider = "runway"
 	Fireworks   ModelProvider = "fireworks"
+	ZaiWeb      ModelProvider = "zai-web"
+	MoClaw      ModelProvider = "moclaw"
 )
 
 // SupportedBaseProviders is the list of base providers allowed for custom providers.

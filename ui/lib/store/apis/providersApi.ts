@@ -349,6 +349,19 @@ export const providersApi = baseApi.injectEndpoints({
 			}),
 		}),
 
+		moclawCheckBalance: builder.mutation<{
+			total_balance: number;
+			plan: { name: string; display_name: string; allowed_models: string[] };
+			period_end: string;
+			wallets: { type: string; balance: number; initial: number; expires_at: string }[];
+		}, { token: string; key_id?: string }>({
+			query: (body) => ({
+				url: '/providers/moclaw/check-balance',
+				method: 'POST',
+				body,
+			}),
+		}),
+
 		getModelParameters: builder.query<ModelDatasheetResponse, string>({
 			queryFn: async (model, _queryApi, _extraOptions, baseQuery) => {
 				const result = await baseQuery(`/models/parameters?model=${encodeURIComponent(model)}`);
@@ -390,4 +403,5 @@ export const {
 	useLazyGetModelParametersQuery,
 	useMoclawLoginMutation,
 	useMoclawBrowserLoginStartMutation,
+	useMoclawCheckBalanceMutation,
 } = providersApi;

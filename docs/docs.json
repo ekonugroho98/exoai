@@ -79,7 +79,8 @@
                   "quickstart/gateway/tool-calling",
                   "quickstart/gateway/multimodal",
                   "quickstart/gateway/reranking",
-                  "quickstart/gateway/integrations"
+                  "quickstart/gateway/integrations",
+                  "quickstart/gateway/zai-web"
                 ]
               },
               "quickstart/cli/getting-started",

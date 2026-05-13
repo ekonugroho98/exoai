@@ -9,15 +9,16 @@
 // client (Cline, Continue, OpenAI SDK, etc.) for moderate use.
 //
 // Configuration:
+//
 //   - API Key (in Bifrost): either the Auth0 *refresh_token* or the raw
 //     *access_token* extracted from a logged-in browser session at moclaw.ai.
 //
 //     Refresh token (preferred, lasts until unused for 30 days):
-//       DevTools → Application → Local Storage → @@auth0spajs@@::...::offline_access → body.refresh_token
+//     DevTools → Application → Local Storage → @@auth0spajs@@::...::offline_access → body.refresh_token
 //
 //     Access token (fallback, 24 h TTL):
-//       DevTools → Application → Local Storage → @@auth0spajs@@::...::offline_access → body.access_token
-//       (starts with "eyJ"; the adapter detects this and skips the Auth0 exchange)
+//     DevTools → Application → Local Storage → @@auth0spajs@@::...::offline_access → body.access_token
+//     (starts with "eyJ"; the adapter detects this and skips the Auth0 exchange)
 //
 // Operational notes:
 //   - The refresh_token rotates every refresh; this adapter persists the
@@ -59,10 +60,10 @@ import (
 // ----------------------------------------------------------------------------
 
 const (
-	defaultAuth0Domain = "https://auth.moclaw.ai"
+	defaultAuth0Domain   = "https://auth.moclaw.ai"
 	defaultAuth0ClientID = "R7QyN3rYIv2DSEqkgQJjfSvvb6XFxMOu"
-	defaultWSURL       = "wss://realtime.moclaw.ai/ws"
-	defaultAPIURL      = "https://api.moclaw.ai"
+	defaultWSURL         = "wss://realtime.moclaw.ai/ws"
+	defaultAPIURL        = "https://api.moclaw.ai"
 
 	// Refresh access_token if expiry is within this window.
 	refreshSafetyMargin = 60 * time.Second
@@ -94,8 +95,8 @@ type MoClawProvider struct {
 	// Per-key auth state. Keyed by the Key's unique identifier so every
 	// configured account gets its own refresh/access-token lifecycle and
 	// its own on-disk rotation cache.
-	authsMu  sync.Mutex
-	auths    map[string]*authState
+	authsMu sync.Mutex
+	auths   map[string]*authState
 
 	// Shared Auth0 config (same for all keys on this provider instance).
 	auth0ClientID string
@@ -108,6 +109,12 @@ type MoClawProvider struct {
 // refresh_token extracted from a logged-in moclaw.ai session.
 func NewMoClawProvider(config *schemas.ProviderConfig, logger schemas.Logger) (*MoClawProvider, error) {
 	config.CheckAndSetDefaults()
+
+	// MoClaw supports multiple accounts (keys). Enable retries so the gateway
+	// can rotate to another key when one account's refresh_token is stale.
+	if config.NetworkConfig.MaxRetries < 5 {
+		config.NetworkConfig.MaxRetries = 5
+	}
 
 	requestTimeout := time.Second * time.Duration(config.NetworkConfig.DefaultRequestTimeoutInSeconds)
 	httpClient := &fasthttp.Client{
@@ -226,6 +233,13 @@ type authState struct {
 	accessToken  string    // 24h TTL, in-memory only
 	expiresAt    time.Time // when accessToken expires
 	cachePath    string    // path to disk cache for refreshToken
+
+	// Per-account session state (v2 API). MoClaw requires a valid
+	// session+thread before the WS will accept "send" frames.
+	appSessionID    string // e.g. "sess_XSNeqpNFs2UspqsK"
+	sessionID       string // e.g. "session_fc72c110-..."
+	threadID        string // e.g. "thread_d19d216d-..."
+	threadBootstrap bool   // true once bootstrap greeting has been consumed
 }
 
 // auth0TokenResp is Auth0's /oauth/token response shape.
@@ -396,6 +410,140 @@ func (a *authState) invalidateAccessToken() {
 	a.expiresAt = time.Time{}
 }
 
+// invalidateSession forces the next call to re-fetch the session.
+func (a *authState) invalidateSession() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.appSessionID = ""
+	a.sessionID = ""
+	a.threadID = ""
+	a.threadBootstrap = false
+}
+
+// getThreadID returns a valid thread ID for the WS "send" frame, fetching
+// or creating a session via the v2 REST API if needed. Each account gets
+// its own session so multiple keys don't interfere.
+func (a *authState) getThreadID(accessToken string, httpClient *fasthttp.Client, apiURL string) (string, error) {
+	a.mu.Lock()
+	if a.threadID != "" {
+		tid := a.threadID
+		a.mu.Unlock()
+		return tid, nil
+	}
+	a.mu.Unlock()
+
+	// GET /api/v2/sessions/active?channel=web
+	req := fasthttp.AcquireRequest()
+	defer fasthttp.ReleaseRequest(req)
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseResponse(resp)
+
+	req.SetRequestURI(apiURL + "/api/v2/sessions/active?channel=web")
+	req.Header.SetMethod(http.MethodGet)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Origin", "https://moclaw.ai")
+	req.Header.Set("Accept", "application/json")
+
+	if err := httpClient.Do(req, resp); err != nil {
+		return "", fmt.Errorf("moclaw session fetch failed: %w", err)
+	}
+	if resp.StatusCode() != fasthttp.StatusOK {
+		return "", fmt.Errorf("moclaw session fetch status=%d body=%s", resp.StatusCode(), string(resp.Body()[:min(200, len(resp.Body()))]))
+	}
+
+	// Parse response: {"app_session_id":"sess_...","session":{"sessionId":"session_...","threadId":"thread_..."}}
+	var sessionResp struct {
+		AppSessionID string `json:"app_session_id"`
+		Session      struct {
+			SessionID string `json:"sessionId"`
+			ThreadID  string `json:"threadId"`
+		} `json:"session"`
+	}
+	if err := sonic.Unmarshal(resp.Body(), &sessionResp); err != nil {
+		return "", fmt.Errorf("moclaw session decode failed: %w", err)
+	}
+	if sessionResp.Session.ThreadID == "" {
+		return "", fmt.Errorf("moclaw session response has no threadId")
+	}
+
+	a.mu.Lock()
+	a.appSessionID = sessionResp.AppSessionID
+	a.sessionID = sessionResp.Session.SessionID
+	a.threadID = sessionResp.Session.ThreadID
+	a.mu.Unlock()
+
+	if a.logger != nil {
+		a.logger.Debug("moclaw: session resolved app=%s thread=%s", sessionResp.AppSessionID, sessionResp.Session.ThreadID)
+	}
+	return sessionResp.Session.ThreadID, nil
+}
+
+// isBootstrapped reports whether this thread has already consumed the
+// MoClaw onboarding greeting. Thread-safe.
+func (a *authState) isBootstrapped() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.threadBootstrap
+}
+
+// markBootstrapped marks the current thread as bootstrapped.
+func (a *authState) markBootstrapped() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.threadBootstrap = true
+}
+
+// bootstrapThread sends a silent "hi" to a fresh MoClaw thread and drains
+// the greeting response. MoClaw's agent system always replies with a
+// greeting on the first message of every new thread (BOOTSTRAP.md +
+// SOUL.md onboarding). This must be consumed before real prompts work.
+//
+// Returns nil on success; the WS connection is ready for the real prompt.
+func (a *authState) bootstrapThread(conn *ws.Conn, threadID string, logger schemas.Logger) error {
+	frame := moclawSendFrame{
+		Type:        "send",
+		ThreadID:    threadID,
+		Content:     "hi",
+		Traceparent: generateTraceparent(),
+	}
+	if err := conn.WriteJSON(frame); err != nil {
+		return fmt.Errorf("bootstrap send failed: %w", err)
+	}
+	logger.Debug("moclaw: bootstrapping thread %s (consuming greeting)", threadID)
+
+	// Drain until query_done or timeout (max 15s for greeting).
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		_ = conn.SetReadDeadline(deadline)
+		_, msgBytes, err := conn.ReadMessage()
+		if err != nil {
+			return fmt.Errorf("bootstrap read failed: %w", err)
+		}
+		var rx moclawRX
+		if err := sonic.Unmarshal(msgBytes, &rx); err != nil {
+			continue
+		}
+		// auth_result comes first on fresh connections
+		if rx.Type == "auth_result" {
+			if rx.Success != nil && !*rx.Success {
+				return fmt.Errorf("bootstrap auth failed")
+			}
+			continue
+		}
+		if rx.Type == "stream" && rx.Event != nil && rx.Event.Event != nil {
+			if rx.Event.Event.Type == "query_done" {
+				break
+			}
+		}
+	}
+	// Reset read deadline for the real conversation
+	_ = conn.SetReadDeadline(time.Time{})
+
+	a.markBootstrapped()
+	logger.Debug("moclaw: thread %s bootstrapped successfully", threadID)
+	return nil
+}
+
 // ----------------------------------------------------------------------------
 // MoClaw wire types (WebSocket frames)
 // ----------------------------------------------------------------------------
@@ -426,10 +574,10 @@ type moclawRX struct {
 
 // moclawRXEvent is the middle layer of stream events.
 type moclawRXEvent struct {
-	EventID   string             `json:"eventId"`
-	QueryID   string             `json:"queryId"`
-	ThreadID  string             `json:"threadId"`
-	Timestamp int64              `json:"timestamp"`
+	EventID   string              `json:"eventId"`
+	QueryID   string              `json:"queryId"`
+	ThreadID  string              `json:"threadId"`
+	Timestamp int64               `json:"timestamp"`
 	Event     *moclawRXEventInner `json:"event"`
 }
 
@@ -543,7 +691,20 @@ func (p *MoClawProvider) ChatCompletionStream(ctx *schemas.BifrostContext, postH
 	auth := p.getOrCreateAuth(key)
 	accessToken, err := auth.getAccessToken(ctx, key.Value.GetValue())
 	if err != nil {
-		return nil, providerUtils.NewBifrostOperationError("moclaw: auth refresh failed", err)
+		// Return 401 (not IsBifrostError) so the retry loop rotates to the next key
+		// instead of failing immediately. This enables sequential key fallback when
+		// one account's refresh_token is stale/rotated.
+		statusCode := 401
+		errType := "auth_error"
+		return nil, &schemas.BifrostError{
+			IsBifrostError: false,
+			StatusCode:     &statusCode,
+			Error: &schemas.ErrorField{
+				Message: "moclaw: auth refresh failed",
+				Type:    &errType,
+				Error:   err,
+			},
+		}
 	}
 
 	// 2. Dial WebSocket with token in URL query.
@@ -601,8 +762,16 @@ func (p *MoClawProvider) ChatCompletionStream(ctx *schemas.BifrostContext, postH
 		return nil, providerUtils.NewBifrostOperationError(msg, dialErr)
 	}
 
-	// 3. Build send frame.
-	threadID := generateThreadID()
+	// 3. Resolve session thread ID via v2 REST API.
+	// MoClaw requires a valid session-bound threadId; random IDs cause "Init failed".
+	apiURL := p.networkConfig.BaseURL
+	threadID, err := auth.getThreadID(accessToken, p.httpClient, apiURL)
+	if err != nil {
+		_ = conn.Close()
+		p.logger.Warn("moclaw: session resolve failed, falling back to random threadId: %v", err)
+		threadID = generateThreadID()
+	}
+	// Allow explicit override via extra_params
 	if extras := request.GetExtraParams(); extras != nil {
 		if v, ok := extras["thread_id"]; ok {
 			if s, ok := v.(string); ok && s != "" {
@@ -610,6 +779,19 @@ func (p *MoClawProvider) ChatCompletionStream(ctx *schemas.BifrostContext, postH
 			}
 		}
 	}
+
+	// 3b. Bootstrap: MoClaw's agent always replies with a greeting on the
+	// first message of a new thread. Send a silent "hi", drain the greeting,
+	// then proceed with the real prompt. Skipped if already bootstrapped.
+	if !auth.isBootstrapped() {
+		if bErr := auth.bootstrapThread(conn, threadID, p.logger); bErr != nil {
+			_ = conn.Close()
+			// Invalidate session so next request gets a fresh thread
+			auth.invalidateSession()
+			return nil, providerUtils.NewBifrostOperationError("moclaw: thread bootstrap failed", bErr)
+		}
+	}
+
 	content := extractLastUserMessage(request.Input)
 	frame := moclawSendFrame{
 		Type:        "send",
@@ -673,6 +855,11 @@ func (p *MoClawProvider) ChatCompletionStream(ctx *schemas.BifrostContext, postH
 			if err != nil {
 				if !ws.IsCloseError(err, ws.CloseNormalClosure) {
 					p.logger.Warn("moclaw: ws read error: %v", err)
+					// "Init failed" means the threadId was invalid/stale.
+					// Invalidate so next request fetches a fresh session.
+					if strings.Contains(err.Error(), "Init failed") {
+						auth.invalidateSession()
+					}
 				}
 				return
 			}
@@ -776,9 +963,9 @@ func (p *MoClawProvider) ChatCompletion(ctx *schemas.BifrostContext, key schemas
 	}
 
 	var (
-		content    strings.Builder
-		reasoning  strings.Builder
-		startedAt  = time.Now()
+		content   strings.Builder
+		reasoning strings.Builder
+		startedAt = time.Now()
 	)
 
 	for chunk := range chunkCh {

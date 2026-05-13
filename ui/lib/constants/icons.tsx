@@ -751,6 +751,54 @@ export const ProviderIcons = {
       </svg>
     );
   },
+  "zai-web": ({ size = "md", className = "" }: IconProps) => {
+    const resolvedSize = resolveSize(size);
+    return (
+      <svg
+        width={resolvedSize}
+        height={resolvedSize}
+        viewBox="0 0 128 128"
+        fill="none"
+        xmlns="http://www.w3.org/2000/svg"
+        className={className}
+      >
+        <title>Z.ai Web</title>
+        <rect x="8" y="8" width="112" height="112" rx="22" fill="#0EA5E9" />
+        <path
+          d="M40 44 H88 L48 84 H88"
+          stroke="#FFFFFF"
+          strokeWidth="10"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          fill="none"
+        />
+      </svg>
+    );
+  },
+  moclaw: ({ size = "md", className = "" }: IconProps) => {
+    const resolvedSize = resolveSize(size);
+    return (
+      <svg
+        width={resolvedSize}
+        height={resolvedSize}
+        viewBox="0 0 128 128"
+        fill="none"
+        xmlns="http://www.w3.org/2000/svg"
+        className={className}
+      >
+        <title>MoClaw</title>
+        <rect x="8" y="8" width="112" height="112" rx="22" fill="#F97316" />
+        <path
+          d="M44 44 L44 84 M44 44 L64 64 L84 44 M84 44 L84 84"
+          stroke="#FFFFFF"
+          strokeWidth="9"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          fill="none"
+        />
+      </svg>
+    );
+  },
 } as const;
 
 // Routing Engine Icons
