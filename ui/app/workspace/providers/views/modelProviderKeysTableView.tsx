@@ -22,6 +22,7 @@ import { RbacOperation, RbacResource, useRbac } from "@enterprise/lib";
 import { AlertCircle, CheckCircle2, EllipsisIcon, Loader2, PencilIcon, PlusIcon, TrashIcon, UploadIcon } from "lucide-react";
 import { ReactNode, useEffect, useState } from "react";
 import { toast } from "sonner";
+import AddCodexAccountsDialog from "../dialogs/addCodexAccountsDialog";
 import AddMoClawAccountsDialog from "../dialogs/addMoClawAccountsDialog";
 import AddNewKeySheet from "../dialogs/addNewKeySheet";
 
@@ -76,6 +77,7 @@ export default function ModelProviderKeysTableView({ provider, className, header
 	const [showAddNewKeyDialog, setShowAddNewKeyDialog] = useState<{ show: boolean; keyId: string | null } | undefined>(undefined);
 	const [showDeleteKeyDialog, setShowDeleteKeyDialog] = useState<{ show: boolean; keyId: string } | undefined>(undefined);
 	const [showMoClawImportDialog, setShowMoClawImportDialog] = useState(false);
+	const [showCodexImportDialog, setShowCodexImportDialog] = useState(false);
 
 	function handleAddKey() {
 		setShowAddNewKeyDialog({ show: true, keyId: null });
@@ -127,6 +129,12 @@ export default function ModelProviderKeysTableView({ provider, className, header
 					onClose={() => setShowMoClawImportDialog(false)}
 				/>
 			)}
+			{providerName === "codex" && (
+				<AddCodexAccountsDialog
+					open={showCodexImportDialog}
+					onClose={() => setShowCodexImportDialog(false)}
+				/>
+			)}
 			{showAddNewKeyDialog && (
 				<AddNewKeySheet
 					show={showAddNewKeyDialog.show}
@@ -146,6 +154,16 @@ export default function ModelProviderKeysTableView({ provider, className, header
 								variant="outline"
 								disabled={!hasUpdateProviderAccess}
 								onClick={() => setShowMoClawImportDialog(true)}
+							>
+								<UploadIcon className="h-4 w-4" />
+								Import Accounts
+							</Button>
+						)}
+						{!isKeyless && providerName === "codex" && (
+							<Button
+								variant="outline"
+								disabled={!hasUpdateProviderAccess}
+								onClick={() => setShowCodexImportDialog(true)}
 							>
 								<UploadIcon className="h-4 w-4" />
 								Import Accounts
