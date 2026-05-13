@@ -11,6 +11,7 @@ export const KnownProvidersNames = [
 	"mistral",
 	"ollama",
 	"openai",
+	"codex",
 	"openrouter",
 	"parasail",
 	"elevenlabs",
@@ -23,7 +24,6 @@ export const KnownProvidersNames = [
 	"vllm",
 	"runway",
 	"fireworks",
-	"codex",
 	"zai-web",
 	"moclaw",
 ] as const;
