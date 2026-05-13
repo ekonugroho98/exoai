@@ -35,7 +35,8 @@ type codexOAuthSession struct {
 var (
 	codexOAuthMu       sync.Mutex
 	codexOAuthSessions = map[string]*codexOAuthSession{}
-	codexCallbackOnce  sync.Once
+	codexCallbackMu    sync.Mutex
+	codexCallbackReady bool
 	codexCallbackErr   error
 )
 
@@ -117,22 +118,28 @@ func (h *ProviderHandler) codexBrowserLoginStatus(ctx *fasthttp.RequestCtx) {
 }
 
 func ensureCodexCallbackServer() error {
-	codexCallbackOnce.Do(func() {
-		mux := http.NewServeMux()
-		mux.HandleFunc("/auth/callback", codexOAuthCallback)
-		server := &http.Server{
-			Handler:           mux,
-			ReadHeaderTimeout: 10 * time.Second,
-		}
-		ln, err := net.Listen("tcp", "127.0.0.1:1455")
-		if err != nil {
-			codexCallbackErr = fmt.Errorf("cannot listen on localhost:1455 for Codex OAuth callback: %w", err)
-			return
-		}
-		go func() {
-			_ = server.Serve(ln)
-		}()
-	})
+	codexCallbackMu.Lock()
+	defer codexCallbackMu.Unlock()
+	if codexCallbackReady {
+		return nil
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/auth/callback", codexOAuthCallback)
+	server := &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:1455")
+	if err != nil {
+		codexCallbackErr = fmt.Errorf("port 1455 is already in use; close the other Codex login callback service first, then try again")
+		return codexCallbackErr
+	}
+	codexCallbackReady = true
+	codexCallbackErr = nil
+	go func() {
+		_ = server.Serve(ln)
+	}()
 	return codexCallbackErr
 }
 
