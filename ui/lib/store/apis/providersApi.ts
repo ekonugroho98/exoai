@@ -349,6 +349,13 @@ export const providersApi = baseApi.injectEndpoints({
 			}),
 		}),
 
+		codexBrowserLoginStart: builder.mutation<{ session_id: string; auth_url: string }, void>({
+			query: () => ({
+				url: '/providers/codex/browser-login',
+				method: 'POST',
+			}),
+		}),
+
 		moclawCheckBalance: builder.mutation<{
 			total_balance: number;
 			plan: { name: string; display_name: string; allowed_models: string[] };
@@ -403,5 +410,6 @@ export const {
 	useLazyGetModelParametersQuery,
 	useMoclawLoginMutation,
 	useMoclawBrowserLoginStartMutation,
+	useCodexBrowserLoginStartMutation,
 	useMoclawCheckBalanceMutation,
 } = providersApi;

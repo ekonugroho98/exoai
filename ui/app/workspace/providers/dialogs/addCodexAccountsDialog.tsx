@@ -10,9 +10,12 @@ import {
 } from "@/components/ui/dialog";
 import { Textarea } from "@/components/ui/textarea";
 import { getErrorMessage } from "@/lib/store";
-import { useCreateProviderKeyMutation } from "@/lib/store/apis/providersApi";
-import { CheckCircle2, ExternalLink, Globe2, KeyIcon, Loader2, XCircle } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import {
+	useCodexBrowserLoginStartMutation,
+	useCreateProviderKeyMutation,
+} from "@/lib/store/apis/providersApi";
+import { CheckCircle2, Globe2, KeyIcon, Loader2, RotateCcw, XCircle } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import { v4 as uuid } from "uuid";
 
@@ -27,6 +30,12 @@ type TokenEntry = {
 type ImportResult =
 	| { status: "pending" }
 	| { status: "done" }
+	| { status: "error"; error: string };
+
+type BrowserResult =
+	| { status: "idle" }
+	| { status: "running"; message: string }
+	| { status: "done"; name: string }
 	| { status: "error"; error: string };
 
 interface Props {
@@ -100,26 +109,45 @@ export default function AddCodexAccountsDialog({ open, onClose }: Props) {
 	const [manualText, setManualText] = useState("");
 	const [isSubmitting, setIsSubmitting] = useState(false);
 	const [results, setResults] = useState<ImportResult[]>([]);
+	const [browserResult, setBrowserResult] = useState<BrowserResult>({ status: "idle" });
+	const evtSourceRef = useRef<EventSource | null>(null);
+	const abortRef = useRef(false);
+	const [startBrowserLogin] = useCodexBrowserLoginStartMutation();
 	const [createProviderKey] = useCreateProviderKeyMutation();
+
+	const stopEventSource = useCallback(() => {
+		evtSourceRef.current?.close();
+		evtSourceRef.current = null;
+	}, []);
 
 	useEffect(() => {
 		if (!open) {
+			abortRef.current = true;
+			stopEventSource();
 			setStep("choose");
 			setManualText("");
 			setIsSubmitting(false);
 			setResults([]);
+			setBrowserResult({ status: "idle" });
 		}
-	}, [open]);
+		return () => stopEventSource();
+	}, [open, stopEventSource]);
 
 	const entries = useMemo(() => parseCodexTokenLines(manualText), [manualText]);
 
 	async function createKey(entry: TokenEntry) {
+		const tokenValue = entry.refreshToken
+			? JSON.stringify({
+				access_token: entry.accessToken,
+				refresh_token: entry.refreshToken,
+			})
+			: entry.accessToken;
 		await createProviderKey({
 			provider: "codex",
 			key: {
 				id: uuid(),
 				name: entry.name,
-				value: { value: entry.accessToken, from_env: false, env_var: "" },
+				value: { value: tokenValue, from_env: false, env_var: "" },
 				models: ["*"],
 				blacklisted_models: [],
 				weight: 1.0,
@@ -159,8 +187,81 @@ export default function AddCodexAccountsDialog({ open, onClose }: Props) {
 		}
 	}
 
-	function openChatGPTLogin() {
-		window.open("https://chatgpt.com/", "_blank", "noopener,noreferrer");
+	function entryNameFromToken(accessToken: string) {
+		const parts = accessToken.split(".");
+		if (parts.length < 2) return "codex-account";
+		try {
+			const payload = JSON.parse(window.atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")));
+			return payload.email || payload.sub || "codex-account";
+		} catch {
+			return "codex-account";
+		}
+	}
+
+	async function handleBrowserLogin() {
+		abortRef.current = false;
+		stopEventSource();
+		setStep("browser");
+		setIsSubmitting(true);
+		setBrowserResult({ status: "running", message: "Waiting for login..." });
+
+		let sessionId = "";
+		try {
+			const res = await startBrowserLogin().unwrap();
+			sessionId = res.session_id;
+			window.open(res.auth_url, "_blank", "noopener,noreferrer");
+		} catch (err) {
+			setIsSubmitting(false);
+			setBrowserResult({ status: "error", error: getErrorMessage(err) });
+			return;
+		}
+
+		const es = new EventSource(`/api/providers/codex/browser-login/${sessionId}`);
+		evtSourceRef.current = es;
+
+		es.addEventListener("status", async (e) => {
+			if (abortRef.current) {
+				stopEventSource();
+				return;
+			}
+			try {
+				const evt = JSON.parse((e as MessageEvent).data);
+				if (evt.status === "done") {
+					stopEventSource();
+					const accessToken = evt.access_token || "";
+					const refreshToken = evt.refresh_token || "";
+					if (!accessToken) {
+						setIsSubmitting(false);
+						setBrowserResult({ status: "error", error: "Login completed without access token" });
+						return;
+					}
+					const name = entryNameFromToken(accessToken);
+					await createKey({ name, accessToken, refreshToken });
+					setIsSubmitting(false);
+					setBrowserResult({ status: "done", name });
+					toast.success("Codex account added");
+					onClose();
+					return;
+				}
+				if (evt.status === "error") {
+					stopEventSource();
+					setIsSubmitting(false);
+					setBrowserResult({ status: "error", error: evt.error || "Login failed" });
+					return;
+				}
+				setBrowserResult({ status: "running", message: evt.message || "Waiting for login..." });
+			} catch (err) {
+				stopEventSource();
+				setIsSubmitting(false);
+				setBrowserResult({ status: "error", error: getErrorMessage(err) });
+			}
+		});
+
+		es.onerror = () => {
+			stopEventSource();
+			setIsSubmitting(false);
+			setBrowserResult({ status: "error", error: "Connection to server lost" });
+		};
 	}
 
 	return (
@@ -193,7 +294,7 @@ export default function AddCodexAccountsDialog({ open, onClose }: Props) {
 					<div className="grid grid-cols-2 gap-5 py-4">
 						<button
 							type="button"
-							onClick={() => setStep("browser")}
+							onClick={handleBrowserLogin}
 							className="border-border hover:border-primary hover:bg-accent flex min-h-40 flex-col items-center justify-center gap-4 rounded-lg border-2 p-6 transition-colors"
 						>
 							<Globe2 className="h-10 w-10 text-cyan-400" />
@@ -217,23 +318,28 @@ export default function AddCodexAccountsDialog({ open, onClose }: Props) {
 				)}
 
 				{step === "browser" && (
-					<div className="flex flex-col gap-4 py-2">
-						<div className="rounded-lg border p-4 text-sm">
-							<div className="font-medium">Login with ChatGPT, then import the Codex token.</div>
-							<p className="text-muted-foreground mt-1">
-								After login, paste your Codex auth JSON or access token below. Access token is saved as the provider key; refresh token is accepted in the pasted format for compatibility.
-							</p>
+					<div className="flex min-h-64 flex-col items-center justify-center gap-6 py-8 text-center">
+						<div className="flex h-16 w-16 items-center justify-center rounded-full bg-green-500/10 text-green-500">
+							{browserResult.status === "error" ? (
+								<XCircle className="h-8 w-8" />
+							) : browserResult.status === "done" ? (
+								<CheckCircle2 className="h-8 w-8" />
+							) : (
+								<RotateCcw className="h-8 w-8 animate-spin" />
+							)}
 						</div>
-						<Button type="button" variant="outline" onClick={openChatGPTLogin} className="w-full">
-							<ExternalLink className="h-4 w-4" />
-							Open ChatGPT Login
-						</Button>
-						<TokenImportForm
-							manualText={manualText}
-							setManualText={setManualText}
-							entries={entries}
-							results={results}
-						/>
+						<div>
+							<div className="text-lg font-semibold">
+								{browserResult.status === "error" && "Login failed"}
+								{browserResult.status === "done" && "Login complete"}
+								{browserResult.status !== "error" && browserResult.status !== "done" && "Waiting for login..."}
+							</div>
+							<div className="text-muted-foreground mt-5 text-base">
+								{browserResult.status === "error" && browserResult.error}
+								{browserResult.status === "done" && `${browserResult.name} added`}
+								{browserResult.status !== "error" && browserResult.status !== "done" && "Complete the login in the browser window."}
+							</div>
+						</div>
 					</div>
 				)}
 
@@ -253,6 +359,17 @@ export default function AddCodexAccountsDialog({ open, onClose }: Props) {
 						<Button variant="outline" onClick={onClose}>
 							Cancel
 						</Button>
+					) : step === "browser" ? (
+						<div className="flex w-full justify-center gap-2">
+							<Button variant="outline" onClick={onClose} disabled={isSubmitting}>
+								Cancel
+							</Button>
+							{browserResult.status === "error" && (
+								<Button onClick={handleBrowserLogin}>
+									Retry
+								</Button>
+							)}
+						</div>
 					) : (
 						<div className="flex w-full justify-between gap-2">
 							<Button variant="outline" onClick={() => setStep("choose")} disabled={isSubmitting}>
