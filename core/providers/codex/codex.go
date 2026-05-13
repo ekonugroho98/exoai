@@ -13,6 +13,7 @@ import (
 
 	"github.com/bytedance/sonic"
 	"github.com/maximhq/bifrost/core/providers/openai"
+	providerUtils "github.com/maximhq/bifrost/core/providers/utils"
 	schemas "github.com/maximhq/bifrost/core/schemas"
 	"github.com/valyala/fasthttp"
 )
@@ -51,11 +52,7 @@ func NewCodexProvider(config *schemas.ProviderConfig, logger schemas.Logger) *Co
 }
 
 func (provider *CodexProvider) ListModels(ctx *schemas.BifrostContext, keys []schemas.Key, request *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
-	resolved := make([]schemas.Key, 0, len(keys))
-	for _, key := range keys {
-		resolved = append(resolved, provider.resolveKey(key))
-	}
-	return provider.OpenAIProvider.ListModels(ctx, resolved, request)
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.ListModelsRequest, schemas.Codex)
 }
 
 func (provider *CodexProvider) ChatCompletion(ctx *schemas.BifrostContext, key schemas.Key, request *schemas.BifrostChatRequest) (*schemas.BifrostChatResponse, *schemas.BifrostError) {
