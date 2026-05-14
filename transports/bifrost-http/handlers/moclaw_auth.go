@@ -47,6 +47,34 @@ func moclawCachedRefreshToken(keyID string) string {
 	return strings.TrimSpace(string(b))
 }
 
+// moclawSaveRefreshToken persists a rotated refresh_token to disk so
+// subsequent exchanges use the latest token (the old one is dead after rotation).
+func moclawSaveRefreshToken(keyID, refreshToken string) {
+	if keyID == "" || refreshToken == "" {
+		return
+	}
+	dir := os.Getenv("BIFROST_DATA_DIR")
+	if dir == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			dir = filepath.Join(home, ".bifrost")
+		}
+	}
+	if dir == "" {
+		return
+	}
+	_ = os.MkdirAll(dir, 0700)
+	safe := strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			return r
+		}
+		return '_'
+	}, keyID)
+	if safe == "" {
+		return
+	}
+	_ = os.WriteFile(filepath.Join(dir, "moclaw_refresh_"+safe+".txt"), []byte(refreshToken), 0600)
+}
+
 // MoClawLoginRequest is the body for the auto-login endpoint.
 type MoClawLoginRequest struct {
 	Email    string `json:"email"`
@@ -162,8 +190,10 @@ func moclawSaveAccessToken(keyID, accessToken string) {
 }
 
 // moclawExchangeRefreshToken exchanges a refresh_token for an access_token via
-// Auth0. Returns the access_token or an error.
-func moclawExchangeRefreshToken(refreshToken string) (string, error) {
+// Auth0. Returns (access_token, new_refresh_token, error).
+// IMPORTANT: Auth0 rotates the refresh_token on every exchange — the caller
+// MUST persist the returned refresh_token; the input one is now dead.
+func moclawExchangeRefreshToken(refreshToken string) (string, string, error) {
 	body, _ := sonic.Marshal(map[string]string{
 		"grant_type":    "refresh_token",
 		"client_id":     moclawAuth0ClientID,
@@ -180,13 +210,13 @@ func moclawExchangeRefreshToken(refreshToken string) (string, error) {
 	rq.Header.Set("Accept", "application/json")
 	rq.SetBody(body)
 	if err := ac.Do(rq, rp); err != nil {
-		return "", fmt.Errorf("auth0 request failed: %w", err)
+		return "", "", fmt.Errorf("auth0 request failed: %w", err)
 	}
 	var tok moclawAuth0TokenResp
 	if err := sonic.Unmarshal(rp.Body(), &tok); err != nil || tok.AccessToken == "" {
-		return "", fmt.Errorf("token exchange failed")
+		return "", "", fmt.Errorf("token exchange failed")
 	}
-	return tok.AccessToken, nil
+	return tok.AccessToken, tok.RefreshToken, nil
 }
 
 // moclawLogin handles POST /api/providers/moclaw/login.
@@ -302,19 +332,19 @@ func (h *ProviderHandler) moclawCheckBalance(ctx *fasthttp.RequestCtx) {
 				refreshToken = cached
 			}
 		}
-		at, err := moclawExchangeRefreshToken(refreshToken)
+		at, newRT, err := moclawExchangeRefreshToken(refreshToken)
 		if err != nil {
-			// 400 (not 401) so the UI baseApi doesn't interpret this as a
-			// session-expired event and force-redirect to /login. This is a
-			// per-provider failure (stale/rotated refresh_token), not a
-			// platform auth failure.
 			SendError(ctx, fasthttp.StatusBadRequest, "failed to exchange refresh token (likely stale or rotated; re-extract from moclaw.ai DevTools)")
 			return
 		}
 		accessToken = at
-		// Persist the fresh access_token so subsequent calls skip the refresh.
 		if req.KeyID != "" {
+			// Persist the fresh access_token so subsequent calls skip the refresh.
 			moclawSaveAccessToken(req.KeyID, accessToken)
+			// Persist the rotated refresh_token — the old one is now dead.
+			if newRT != "" {
+				moclawSaveRefreshToken(req.KeyID, newRT)
+			}
 		}
 	}
 

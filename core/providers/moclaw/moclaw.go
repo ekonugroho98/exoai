@@ -240,6 +240,12 @@ type authState struct {
 	sessionID       string // e.g. "session_fc72c110-..."
 	threadID        string // e.g. "thread_d19d216d-..."
 	threadBootstrap bool   // true once bootstrap greeting has been consumed
+
+	// Persistent WS connection. MoClaw's agent always greets on the
+	// first message of a new WS connection. By keeping the connection
+	// open and reusing it, subsequent messages get real responses.
+	wsConn   *ws.Conn  // nil = not connected
+	wsMu     sync.Mutex // serializes WS send/recv (one request at a time)
 }
 
 // auth0TokenResp is Auth0's /oauth/token response shape.
@@ -420,62 +426,87 @@ func (a *authState) invalidateSession() {
 	a.threadBootstrap = false
 }
 
-// getThreadID returns a valid thread ID for the WS "send" frame, fetching
-// or creating a session via the v2 REST API if needed. Each account gets
-// its own session so multiple keys don't interfere.
+// getThreadID creates a fresh thread for each request via the v2 REST API.
+// MoClaw threads accumulate conversation context — reusing a thread causes
+// the model to answer from cached context instead of processing the new prompt.
+// Each request gets its own thread to ensure isolation.
 func (a *authState) getThreadID(accessToken string, httpClient *fasthttp.Client, apiURL string) (string, error) {
+	// Resolve app_session_id (cached — same for all threads in this account)
 	a.mu.Lock()
-	if a.threadID != "" {
-		tid := a.threadID
-		a.mu.Unlock()
-		return tid, nil
-	}
+	appSession := a.appSessionID
 	a.mu.Unlock()
 
-	// GET /api/v2/sessions/active?channel=web
-	req := fasthttp.AcquireRequest()
-	defer fasthttp.ReleaseRequest(req)
-	resp := fasthttp.AcquireResponse()
-	defer fasthttp.ReleaseResponse(resp)
+	if appSession == "" {
+		// Fetch active session first
+		req := fasthttp.AcquireRequest()
+		defer fasthttp.ReleaseRequest(req)
+		resp := fasthttp.AcquireResponse()
+		defer fasthttp.ReleaseResponse(resp)
 
-	req.SetRequestURI(apiURL + "/api/v2/sessions/active?channel=web")
-	req.Header.SetMethod(http.MethodGet)
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("Origin", "https://moclaw.ai")
-	req.Header.Set("Accept", "application/json")
+		req.SetRequestURI(apiURL + "/api/v2/sessions/active?channel=web")
+		req.Header.SetMethod(http.MethodGet)
+		req.Header.Set("Authorization", "Bearer "+accessToken)
+		req.Header.Set("Origin", "https://moclaw.ai")
+		req.Header.Set("Accept", "application/json")
 
-	if err := httpClient.Do(req, resp); err != nil {
-		return "", fmt.Errorf("moclaw session fetch failed: %w", err)
+		if err := httpClient.Do(req, resp); err != nil {
+			return "", fmt.Errorf("moclaw session fetch failed: %w", err)
+		}
+		if resp.StatusCode() != fasthttp.StatusOK {
+			return "", fmt.Errorf("moclaw session fetch status=%d body=%s", resp.StatusCode(), string(resp.Body()[:min(200, len(resp.Body()))]))
+		}
+
+		var sessionResp struct {
+			AppSessionID string `json:"app_session_id"`
+		}
+		if err := sonic.Unmarshal(resp.Body(), &sessionResp); err != nil {
+			return "", fmt.Errorf("moclaw session decode failed: %w", err)
+		}
+		if sessionResp.AppSessionID == "" {
+			return "", fmt.Errorf("moclaw session response has no app_session_id")
+		}
+		a.mu.Lock()
+		a.appSessionID = sessionResp.AppSessionID
+		a.mu.Unlock()
+		appSession = sessionResp.AppSessionID
 	}
-	if resp.StatusCode() != fasthttp.StatusOK {
-		return "", fmt.Errorf("moclaw session fetch status=%d body=%s", resp.StatusCode(), string(resp.Body()[:min(200, len(resp.Body()))]))
+
+	// Create a NEW thread for this request
+	req2 := fasthttp.AcquireRequest()
+	defer fasthttp.ReleaseRequest(req2)
+	resp2 := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseResponse(resp2)
+
+	req2.SetRequestURI(apiURL + "/api/v2/sessions/" + appSession + "/threads")
+	req2.Header.SetMethod(http.MethodPost)
+	req2.Header.Set("Authorization", "Bearer "+accessToken)
+	req2.Header.Set("Origin", "https://moclaw.ai")
+	req2.Header.SetContentType("application/json")
+	req2.SetBody([]byte("{}"))
+
+	if err := httpClient.Do(req2, resp2); err != nil {
+		return "", fmt.Errorf("moclaw thread create failed: %w", err)
+	}
+	if resp2.StatusCode() != fasthttp.StatusOK && resp2.StatusCode() != fasthttp.StatusCreated {
+		return "", fmt.Errorf("moclaw thread create status=%d", resp2.StatusCode())
 	}
 
-	// Parse response: {"app_session_id":"sess_...","session":{"sessionId":"session_...","threadId":"thread_..."}}
-	var sessionResp struct {
-		AppSessionID string `json:"app_session_id"`
-		Session      struct {
-			SessionID string `json:"sessionId"`
-			ThreadID  string `json:"threadId"`
+	var threadResp struct {
+		Session struct {
+			ThreadID string `json:"threadId"`
 		} `json:"session"`
 	}
-	if err := sonic.Unmarshal(resp.Body(), &sessionResp); err != nil {
-		return "", fmt.Errorf("moclaw session decode failed: %w", err)
+	if err := sonic.Unmarshal(resp2.Body(), &threadResp); err != nil {
+		return "", fmt.Errorf("moclaw thread decode failed: %w", err)
 	}
-	if sessionResp.Session.ThreadID == "" {
-		return "", fmt.Errorf("moclaw session response has no threadId")
+	if threadResp.Session.ThreadID == "" {
+		return "", fmt.Errorf("moclaw thread response has no threadId")
 	}
-
-	a.mu.Lock()
-	a.appSessionID = sessionResp.AppSessionID
-	a.sessionID = sessionResp.Session.SessionID
-	a.threadID = sessionResp.Session.ThreadID
-	a.mu.Unlock()
 
 	if a.logger != nil {
-		a.logger.Debug("moclaw: session resolved app=%s thread=%s", sessionResp.AppSessionID, sessionResp.Session.ThreadID)
+		a.logger.Debug("moclaw: created fresh thread %s for request", threadResp.Session.ThreadID)
 	}
-	return sessionResp.Session.ThreadID, nil
+	return threadResp.Session.ThreadID, nil
 }
 
 // isBootstrapped reports whether this thread has already consumed the
@@ -641,6 +672,10 @@ func generateChatCompletionID() string {
 // extractLastUserMessage flattens the tail user message from a Bifrost
 // chat request into a single string (MoClaw's send protocol carries one
 // content per frame).
+//
+// Kept for callers that intentionally want only the last turn (e.g.
+// single-shot probes). Multi-turn callers should use flattenConversation
+// to preserve OpenAI semantics — see ChatCompletionStream.
 func extractLastUserMessage(input []schemas.ChatMessage) string {
 	for i := len(input) - 1; i >= 0; i-- {
 		if input[i].Role == schemas.ChatMessageRoleUser {
@@ -651,6 +686,80 @@ func extractLastUserMessage(input []schemas.ChatMessage) string {
 		return flattenContent(input[len(input)-1].Content)
 	}
 	return ""
+}
+
+// flattenConversation collapses a full OpenAI-style messages array into a
+// single prompt string for MoClaw's single-content-per-frame protocol.
+//
+// Why this exists:
+//   MoClaw's WS `send` frame carries one `content` field — there is no
+//   schema for prior turns. The server does track its own per-thread
+//   conversation history, but OpenAI clients (Cline, Continue, openai-sdk,
+//   etc.) re-send the FULL conversation on every request, expecting the
+//   model to use that history (not the server's). If we only forward the
+//   tail user message, the model will respond based on stale server-side
+//   memory rather than the client's intended context.
+//
+// Format:
+//   Single-message requests (just one user turn) pass through unchanged —
+//   no role markers, no preamble — to keep simple probes clean.
+//
+//   Multi-turn requests get rendered as:
+//     [system]
+//     <system content>
+//
+//     [user]
+//     <turn 1 user>
+//
+//     [assistant]
+//     <turn 1 assistant>
+//
+//     [user]
+//     <turn 2 user>
+//
+//   The trailing user turn is what the model is asked to respond to.
+//   Tool calls and other non-text content are flattened to text only;
+//   MoClaw doesn't expose tool calling via this transport.
+func flattenConversation(input []schemas.ChatMessage) string {
+	if len(input) == 0 {
+		return ""
+	}
+	// Fast path: single message → no role markup (cleanest output).
+	if len(input) == 1 {
+		return flattenContent(input[0].Content)
+	}
+	// Fast path: only the last message has content and it's user → same
+	// as single-turn.
+	nonEmpty := 0
+	var lastUserOnly bool = true
+	for i, m := range input {
+		text := flattenContent(m.Content)
+		if text != "" {
+			nonEmpty++
+			if i != len(input)-1 || m.Role != schemas.ChatMessageRoleUser {
+				lastUserOnly = false
+			}
+		}
+	}
+	if nonEmpty == 1 && lastUserOnly {
+		return flattenContent(input[len(input)-1].Content)
+	}
+
+	var b strings.Builder
+	for _, m := range input {
+		text := flattenContent(m.Content)
+		if text == "" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString("[")
+		b.WriteString(string(m.Role))
+		b.WriteString("]\n")
+		b.WriteString(text)
+	}
+	return b.String()
 }
 
 // flattenContent reduces ChatMessageContent to a single string.
@@ -674,12 +783,131 @@ func flattenContent(c *schemas.ChatMessageContent) string {
 }
 
 // ----------------------------------------------------------------------------
+// Persistent WS connection management
+// ----------------------------------------------------------------------------
+
+// dialWS creates a new WebSocket connection to MoClaw's realtime endpoint.
+func (p *MoClawProvider) dialWS(ctx context.Context, accessToken string) (*ws.Conn, error) {
+	wsURL := defaultWSURL
+	if v, ok := p.networkConfig.ExtraHeaders["X-MoClaw-WS-URL"]; ok && v != "" {
+		wsURL = v
+	}
+	wsURL += "?token=" + url.QueryEscape(accessToken)
+
+	wsHeaders := http.Header{}
+	wsHeaders.Set("Origin", "https://moclaw.ai")
+	wsHeaders.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36")
+	wsHeaders.Set("Accept-Language", "en-US,en;q=0.9")
+	wsHeaders.Set("Cache-Control", "no-cache")
+	wsHeaders.Set("Pragma", "no-cache")
+	wsHeaders.Set("Sec-Fetch-Site", "same-site")
+	wsHeaders.Set("Sec-Fetch-Mode", "websocket")
+	wsHeaders.Set("Sec-Fetch-Dest", "websocket")
+	for k, v := range p.networkConfig.ExtraHeaders {
+		if strings.HasPrefix(k, "X-MoClaw-WS-") {
+			continue
+		}
+		wsHeaders.Set(k, v)
+	}
+
+	dialer := ws.Dialer{HandshakeTimeout: 15 * time.Second}
+	conn, dialResp, err := dialer.DialContext(ctx, wsURL, wsHeaders)
+	if err != nil {
+		body := ""
+		status := 0
+		if dialResp != nil {
+			status = dialResp.StatusCode
+			if dialResp.Body != nil {
+				buf := make([]byte, 2048)
+				n, _ := dialResp.Body.Read(buf)
+				body = strings.TrimSpace(string(buf[:n]))
+				_ = dialResp.Body.Close()
+			}
+		}
+		return nil, fmt.Errorf("ws dial failed status=%d body=%q: %w", status, body, err)
+	}
+	return conn, nil
+}
+
+// getOrDialWS returns the persistent WS connection for this auth state,
+// dialing a new one if needed. Also performs bootstrap (greeting drain)
+// on fresh connections. Caller must hold auth.wsMu.
+func (a *authState) getOrDialWS(ctx context.Context, p *MoClawProvider, accessToken, threadID string) (*ws.Conn, error) {
+	// Check if existing connection is alive
+	if a.wsConn != nil {
+		// Quick ping check
+		if err := a.wsConn.WriteControl(ws.PingMessage, nil, time.Now().Add(2*time.Second)); err == nil {
+			return a.wsConn, nil
+		}
+		// Dead connection — close and reconnect
+		_ = a.wsConn.Close()
+		a.wsConn = nil
+		a.threadBootstrap = false
+	}
+
+	// Dial new connection
+	conn, err := p.dialWS(ctx, accessToken)
+	if err != nil {
+		return nil, err
+	}
+
+	// Wait for auth_result
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	_, authMsg, err := conn.ReadMessage()
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("ws auth read failed: %w", err)
+	}
+	var authRX moclawRX
+	if err := sonic.Unmarshal(authMsg, &authRX); err == nil {
+		if authRX.Type == "auth_result" && authRX.Success != nil && !*authRX.Success {
+			_ = conn.Close()
+			return nil, fmt.Errorf("ws auth_result success=false")
+		}
+	}
+	_ = conn.SetReadDeadline(time.Time{})
+
+	// NOTE: bootstrap removed (2026-05).
+	//
+	// Original assumption was: "MoClaw always greets on the first message of
+	// a new thread, so we must drain that greeting before real prompts work."
+	//
+	// That's only true for *fresh* threads. But getThreadID() returns the
+	// user's session-bound thread from /api/v2/sessions/active — a
+	// long-lived thread already populated with history. Sending "hi" to it
+	// just appends to that history (wastes a credit, pollutes context), and
+	// the response is a real reply, not a greeting.
+	//
+	// Net effect of removing bootstrap:
+	//   - Saves one credit per fresh WS connection.
+	//   - Eliminates leak of bootstrap-response events into the first real
+	//     request's stream.
+	//   - For genuinely fresh threads (callers overriding via
+	//     ExtraParams.thread_id), any greeting events arrive as normal
+	//     stream events; the read loop ignores non-text/non-thinking types
+	//     via `continue`, so they're dropped harmlessly.
+	a.threadBootstrap = true // keep flag set so legacy code paths see "bootstrapped"
+
+	a.wsConn = conn
+	return conn, nil
+}
+
+// closeWS closes the persistent WS connection.
+func (a *authState) closeWS() {
+	if a.wsConn != nil {
+		_ = a.wsConn.Close()
+		a.wsConn = nil
+		a.threadBootstrap = false
+	}
+}
+
+// ----------------------------------------------------------------------------
 // ChatCompletionStream — open WS, send, stream chunks back
 // ----------------------------------------------------------------------------
 
-// ChatCompletionStream opens a fresh WebSocket connection to MoClaw's realtime
-// endpoint, sends the user's last message as a single "send" frame, and
-// streams parsed chunks back via a Bifrost stream channel.
+// ChatCompletionStream uses a persistent WebSocket connection to MoClaw's
+// realtime endpoint. The first request bootstraps (consumes the greeting),
+// subsequent requests reuse the same connection for real responses.
 //
 // Mapping from MoClaw events → OpenAI-style deltas:
 //
@@ -691,9 +919,6 @@ func (p *MoClawProvider) ChatCompletionStream(ctx *schemas.BifrostContext, postH
 	auth := p.getOrCreateAuth(key)
 	accessToken, err := auth.getAccessToken(ctx, key.Value.GetValue())
 	if err != nil {
-		// Return 401 (not IsBifrostError) so the retry loop rotates to the next key
-		// instead of failing immediately. This enables sequential key fallback when
-		// one account's refresh_token is stale/rotated.
 		statusCode := 401
 		errType := "auth_error"
 		return nil, &schemas.BifrostError{
@@ -707,71 +932,33 @@ func (p *MoClawProvider) ChatCompletionStream(ctx *schemas.BifrostContext, postH
 		}
 	}
 
-	// 2. Dial WebSocket with token in URL query.
-	wsURL := defaultWSURL
-	if v, ok := p.networkConfig.ExtraHeaders["X-MoClaw-WS-URL"]; ok && v != "" {
-		wsURL = v
-	}
-	wsURL += "?token=" + url.QueryEscape(accessToken)
-
-	// Required headers for the handshake. moclaw.ai's realtime server:
-	//   - checks Origin (CSRF defense) — must be https://moclaw.ai
-	//   - filters non-browser User-Agents — must look like a real browser
-	//   - may inspect Sec-Fetch-* (sent by browsers automatically)
-	// Without these, the upgrade returns "bad handshake".
-	wsHeaders := http.Header{}
-	wsHeaders.Set("Origin", "https://moclaw.ai")
-	wsHeaders.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36")
-	wsHeaders.Set("Accept-Language", "en-US,en;q=0.9")
-	wsHeaders.Set("Cache-Control", "no-cache")
-	wsHeaders.Set("Pragma", "no-cache")
-	wsHeaders.Set("Sec-Fetch-Site", "same-site")
-	wsHeaders.Set("Sec-Fetch-Mode", "websocket")
-	wsHeaders.Set("Sec-Fetch-Dest", "websocket")
-	for k, v := range p.networkConfig.ExtraHeaders {
-		// Allow callers to override defaults via NetworkConfig.ExtraHeaders.
-		if strings.HasPrefix(k, "X-MoClaw-WS-") {
-			continue // these are adapter directives, not HTTP headers
-		}
-		wsHeaders.Set(k, v)
-	}
-
-	dialer := ws.Dialer{
-		HandshakeTimeout: 15 * time.Second,
-	}
-	conn, dialResp, dialErr := dialer.DialContext(ctx, wsURL, wsHeaders)
-	if dialErr != nil {
-		// Surface the upstream HTTP response (status + body) to make
-		// handshake failures debuggable — websocket error itself is generic.
-		body := ""
-		status := 0
-		if dialResp != nil {
-			status = dialResp.StatusCode
-			if dialResp.Body != nil {
-				buf := make([]byte, 2048)
-				n, _ := dialResp.Body.Read(buf)
-				body = strings.TrimSpace(string(buf[:n]))
-				_ = dialResp.Body.Close()
-			}
-		}
-		// On 401, drop access_token so next call forces a refresh.
-		if status == http.StatusUnauthorized {
-			auth.invalidateAccessToken()
-		}
-		msg := fmt.Sprintf("moclaw: ws dial failed status=%d body=%q url_token_len=%d", status, body, len(accessToken))
-		return nil, providerUtils.NewBifrostOperationError(msg, dialErr)
-	}
-
-	// 3. Resolve session thread ID via v2 REST API.
-	// MoClaw requires a valid session-bound threadId; random IDs cause "Init failed".
+	// 2. Resolve session thread ID.
 	apiURL := p.networkConfig.BaseURL
 	threadID, err := auth.getThreadID(accessToken, p.httpClient, apiURL)
 	if err != nil {
-		_ = conn.Close()
-		p.logger.Warn("moclaw: session resolve failed, falling back to random threadId: %v", err)
-		threadID = generateThreadID()
+		// NOTE: was silently falling back to generateThreadID() here.
+		//
+		// That's a footgun: MoClaw treats unknown threadIds as fresh
+		// conversations, and fresh conversations always reply with the
+		// onboarding greeting ("Hey! What's up?") regardless of the prompt
+		// content. The fallback turned every "session resolve failed" into
+		// a silent "all replies are greetings" mystery.
+		//
+		// Now: return the error. If session resolve is broken, the caller
+		// gets a 502 they can debug, not a misleading greeting.
+		p.logger.Error("moclaw: session resolve failed: %v", err)
+		statusCode := 502
+		errType := "session_resolve_error"
+		return nil, &schemas.BifrostError{
+			IsBifrostError: false,
+			StatusCode:     &statusCode,
+			Error: &schemas.ErrorField{
+				Message: fmt.Sprintf("moclaw: cannot resolve session thread: %v", err),
+				Type:    &errType,
+				Error:   err,
+			},
+		}
 	}
-	// Allow explicit override via extra_params
 	if extras := request.GetExtraParams(); extras != nil {
 		if v, ok := extras["thread_id"]; ok {
 			if s, ok := v.(string); ok && s != "" {
@@ -780,19 +967,54 @@ func (p *MoClawProvider) ChatCompletionStream(ctx *schemas.BifrostContext, postH
 		}
 	}
 
-	// 3b. Bootstrap: MoClaw's agent always replies with a greeting on the
-	// first message of a new thread. Send a silent "hi", drain the greeting,
-	// then proceed with the real prompt. Skipped if already bootstrapped.
-	if !auth.isBootstrapped() {
-		if bErr := auth.bootstrapThread(conn, threadID, p.logger); bErr != nil {
-			_ = conn.Close()
-			// Invalidate session so next request gets a fresh thread
-			auth.invalidateSession()
-			return nil, providerUtils.NewBifrostOperationError("moclaw: thread bootstrap failed", bErr)
+	// 3. Dial fresh WS connection.
+	conn, dialErr := p.dialWS(ctx, accessToken)
+	if dialErr != nil {
+		if strings.Contains(dialErr.Error(), "401") {
+			auth.invalidateAccessToken()
 		}
+		return nil, providerUtils.NewBifrostOperationError("moclaw: ws connect failed", dialErr)
 	}
 
-	content := extractLastUserMessage(request.Input)
+	// 3b. Wait for auth_result before sending.
+	//
+	// MoClaw's server pushes an `auth_result` frame right after the WS
+	// upgrade. If we WriteJSON the "send" frame before that handshake
+	// completes server-side, the server silently drops the frame (no
+	// error, no response), and the read loop hangs forever waiting for
+	// stream events that never arrive.
+	//
+	// Browser UI works because it implicitly waits (its onmessage handler
+	// processes auth_result before any user-initiated send). We need to
+	// emulate that explicitly.
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	_, authMsg, authErr := conn.ReadMessage()
+	if authErr != nil {
+		_ = conn.Close()
+		if strings.Contains(authErr.Error(), "401") || strings.Contains(authErr.Error(), "unauthorized") {
+			auth.invalidateAccessToken()
+		}
+		return nil, providerUtils.NewBifrostOperationError("moclaw: ws auth handshake read failed", authErr)
+	}
+	{
+		var authRX moclawRX
+		if uerr := sonic.Unmarshal(authMsg, &authRX); uerr == nil {
+			if authRX.Type == "auth_result" && authRX.Success != nil && !*authRX.Success {
+				_ = conn.Close()
+				auth.invalidateAccessToken()
+				return nil, providerUtils.NewBifrostOperationError("moclaw: ws auth_result success=false", fmt.Errorf("auth rejected by server"))
+			}
+		}
+	}
+	_ = conn.SetReadDeadline(time.Time{})
+
+	// 4. Send the real prompt.
+	//
+	// MoClaw's WS protocol carries one content per frame, so for multi-turn
+	// requests we flatten the full OpenAI messages array into a single
+	// prompt with [role] headers. Single-turn requests pass through clean
+	// (no headers) — see flattenConversation for details.
+	content := flattenConversation(request.Input)
 	frame := moclawSendFrame{
 		Type:        "send",
 		ThreadID:    threadID,
@@ -805,7 +1027,7 @@ func (p *MoClawProvider) ChatCompletionStream(ctx *schemas.BifrostContext, postH
 		return nil, providerUtils.NewBifrostOperationError("moclaw: ws write failed", err)
 	}
 
-	// 4. Stream goroutine.
+	// 5. Stream goroutine.
 	responseChan := make(chan *schemas.BifrostStreamChunk, schemas.DefaultStreamBufferSize)
 	providerUtils.SetStreamIdleTimeoutIfEmpty(ctx, p.networkConfig.StreamIdleTimeoutInSeconds)
 
@@ -814,6 +1036,7 @@ func (p *MoClawProvider) ChatCompletionStream(ctx *schemas.BifrostContext, postH
 	startTime := time.Now()
 
 	go func() {
+		defer conn.Close()
 		defer providerUtils.EnsureStreamFinalizerCalled(ctx, postHookSpanFinalizer)
 		defer func() {
 			if ctx.Err() == context.Canceled {
@@ -823,10 +1046,28 @@ func (p *MoClawProvider) ChatCompletionStream(ctx *schemas.BifrostContext, postH
 			}
 			close(responseChan)
 		}()
-		defer conn.Close()
 
 		chunkIndex := 0
 		lastChunkTime := startTime
+
+		// ourThreadID is the thread we created for THIS request (see step 2 above).
+		//
+		// MoClaw's WS is auth-scoped (per user token), not thread-scoped:
+		// once authenticated, the server pushes events for ANY of the user's
+		// threads to this connection. With parallel requests (each in its own
+		// fresh thread), every WS sees the union of all in-flight responses.
+		//
+		// To isolate this request's response we drop any event whose
+		// threadId doesn't match the thread we just created. Since
+		// getThreadID() POSTs a fresh /threads each call, ourThreadID is
+		// guaranteed unique and the filter is foolproof — no race-prone
+		// first-event guessing.
+		ourThreadID := threadID
+
+		// First-queryId capture as a *secondary* filter for the edge case
+		// where threadId is missing from an event envelope. Not used unless
+		// threadId is empty.
+		var ourQueryID string
 
 		emit := func(chatResp *schemas.BifrostChatResponse) {
 			if chatResp == nil {
@@ -840,11 +1081,14 @@ func (p *MoClawProvider) ChatCompletionStream(ctx *schemas.BifrostContext, postH
 			chatResp.ExtraFields.Latency = time.Since(lastChunkTime).Milliseconds()
 			chunkIndex++
 			lastChunkTime = time.Now()
-			providerUtils.ProcessAndSendResponse(
-				ctx, postHookRunner,
-				providerUtils.GetBifrostResponseForStreamResponse(nil, chatResp, nil, nil, nil, nil),
-				responseChan, postHookSpanFinalizer,
-			)
+			resp := providerUtils.GetBifrostResponseForStreamResponse(nil, chatResp, nil, nil, nil, nil)
+			if postHookRunner != nil {
+				providerUtils.ProcessAndSendResponse(ctx, postHookRunner, resp, responseChan, postHookSpanFinalizer)
+			} else {
+				// Non-streaming caller (ChatCompletion) passes nil postHookRunner.
+				// Send directly to channel without hook processing.
+				responseChan <- &schemas.BifrostStreamChunk{BifrostChatResponse: chatResp}
+			}
 		}
 
 		for {
@@ -855,11 +1099,9 @@ func (p *MoClawProvider) ChatCompletionStream(ctx *schemas.BifrostContext, postH
 			if err != nil {
 				if !ws.IsCloseError(err, ws.CloseNormalClosure) {
 					p.logger.Warn("moclaw: ws read error: %v", err)
-					// "Init failed" means the threadId was invalid/stale.
-					// Invalidate so next request fetches a fresh session.
-					if strings.Contains(err.Error(), "Init failed") {
-						auth.invalidateSession()
-					}
+				}
+				if strings.Contains(err.Error(), "Init failed") {
+					auth.invalidateSession()
 				}
 				return
 			}
@@ -870,17 +1112,10 @@ func (p *MoClawProvider) ChatCompletionStream(ctx *schemas.BifrostContext, postH
 				continue
 			}
 
-			// Auth result frame is informational; first frame after dial.
+			// Auth result already handled in ChatCompletionStream pre-send
+			// handshake; skip if received again (server should not re-send,
+			// but be defensive).
 			if rx.Type == "auth_result" {
-				if rx.Success != nil && !*rx.Success {
-					auth.invalidateAccessToken()
-					ctx.SetValue(schemas.BifrostContextKeyStreamEndIndicator, true)
-					providerUtils.ProcessAndSendBifrostError(ctx, postHookRunner, &schemas.BifrostError{
-						IsBifrostError: false,
-						Error:          &schemas.ErrorField{Message: "moclaw: ws auth_result success=false"},
-					}, responseChan, p.logger, postHookSpanFinalizer)
-					return
-				}
 				continue
 			}
 
@@ -888,6 +1123,37 @@ func (p *MoClawProvider) ChatCompletionStream(ctx *schemas.BifrostContext, postH
 				continue
 			}
 			inner := rx.Event.Event
+
+			// PRIMARY filter: threadId.
+			//
+			// Drop any event whose threadId doesn't match the thread we
+			// created for this request. The auth-scoped WS may carry
+			// concurrent users' responses on the same socket, but each
+			// request has its own freshly-POSTed thread so this filter is
+			// deterministic.
+			frameThreadID := rx.Event.ThreadID
+			if frameThreadID == "" {
+				frameThreadID = inner.ThreadID
+			}
+			if frameThreadID != "" && frameThreadID != ourThreadID {
+				continue
+			}
+
+			// SECONDARY filter: queryId.
+			//
+			// Defensive fallback if the server ever omits threadId on an
+			// event (none observed in practice, but cheap insurance). The
+			// FIRST event matching our thread locks the queryId; later
+			// events with a different queryId are dropped.
+			frameQID := rx.Event.QueryID
+			if frameQID == "" {
+				frameQID = inner.QueryID
+			}
+			if ourQueryID == "" {
+				ourQueryID = frameQID
+			} else if frameQID != "" && frameQID != ourQueryID {
+				continue
+			}
 
 			switch inner.Type {
 			case "query_start", "thinking_start", "thinking_end":
@@ -1023,8 +1289,28 @@ func (p *MoClawProvider) ChatCompletion(ctx *schemas.BifrostContext, key schemas
 // Unsupported operations
 // ----------------------------------------------------------------------------
 
+// ListModels returns the hardcoded list of MoClaw-served models.
+//
+// MoClaw doesn't expose a public /v1/models endpoint — the available models
+// are advertised on moclaw.ai's landing page and bound per-session via the
+// web UI's model picker. We return them statically so Bifrost's model
+// catalog has entries to route against; otherwise wildcard ("*") keys leave
+// the catalog empty and chat/completions requests hang.
+//
+// Keep in sync with moclaw.ai's marketing page and the placeholder string
+// at ui/lib/constants/config.ts (moclaw line).
 func (p *MoClawProvider) ListModels(ctx *schemas.BifrostContext, keys []schemas.Key, request *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
-	return nil, providerUtils.NewUnsupportedOperationError(schemas.ListModelsRequest, schemas.MoClaw)
+	prefix := string(schemas.MoClaw) + "/"
+	names := []string{
+		"claude-opus-4-6",
+		"claude-sonnet-4-6",
+		"deepseek-v4-pro",
+	}
+	data := make([]schemas.Model, 0, len(names))
+	for _, n := range names {
+		data = append(data, schemas.Model{ID: prefix + n})
+	}
+	return &schemas.BifrostListModelsResponse{Data: data}, nil
 }
 func (p *MoClawProvider) TextCompletion(ctx *schemas.BifrostContext, key schemas.Key, request *schemas.BifrostTextCompletionRequest) (*schemas.BifrostTextCompletionResponse, *schemas.BifrostError) {
 	return nil, providerUtils.NewUnsupportedOperationError("text completion", "moclaw")
