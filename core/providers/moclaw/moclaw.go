@@ -201,11 +201,13 @@ func (p *MoClawProvider) getOrCreateAuth(key schemas.Key) *authState {
 		return a
 	}
 	a := &authState{
-		clientID:   p.auth0ClientID,
-		auth0URL:   p.auth0URL,
-		httpClient: p.httpClient,
-		logger:     p.logger,
-		cachePath:  resolveRefreshTokenCachePathForKey(keyID),
+		clientID:      p.auth0ClientID,
+		auth0URL:      p.auth0URL,
+		httpClient:    p.httpClient,
+		logger:        p.logger,
+		cachePath:     resolveRefreshTokenCachePathForKey(keyID),
+		inFlight:      make(chan struct{}, 1), // capacity 1 = "at most one WS request in flight"
+		creditBalance: -1,                     // -1 = unknown until first fetch
 	}
 	p.auths[keyID] = a
 	return a
@@ -244,8 +246,26 @@ type authState struct {
 	// Persistent WS connection. MoClaw's agent always greets on the
 	// first message of a new WS connection. By keeping the connection
 	// open and reusing it, subsequent messages get real responses.
-	wsConn   *ws.Conn  // nil = not connected
-	wsMu     sync.Mutex // serializes WS send/recv (one request at a time)
+	wsConn *ws.Conn   // nil = not connected
+	wsMu   sync.Mutex // serializes WS send/recv (one request at a time)
+
+	// inFlight is a 1-slot semaphore that serializes WS requests for
+	// THIS account. MoClaw's WS is auth-scoped (one user = one event
+	// bus), so opening multiple parallel WS connections under the same
+	// token causes server-side event cross-routing (we observed this
+	// empirically — see provider docstring). Forcing one-in-flight per
+	// key sidesteps that without throwing requests away: parallel callers
+	// queue here, or rotate to other keys via Bifrost retry if this one
+	// is busy.
+	inFlight chan struct{}
+
+	// Credit accounting cache. Refreshed on a TTL and on every observed
+	// "insufficient credits" error from the server.
+	creditMu        sync.Mutex
+	creditBalance   int       // last-known balance; -1 = unknown
+	creditFetchedAt time.Time // when creditBalance was set
+	creditExhausted bool      // true after server returned an out-of-credit error
+	creditResetAt   time.Time // server-side reset time (period_end of trial wallet)
 }
 
 // auth0TokenResp is Auth0's /oauth/token response shape.
@@ -507,6 +527,159 @@ func (a *authState) getThreadID(accessToken string, httpClient *fasthttp.Client,
 		a.logger.Debug("moclaw: created fresh thread %s for request", threadResp.Session.ThreadID)
 	}
 	return threadResp.Session.ThreadID, nil
+}
+
+// ----------------------------------------------------------------------------
+// Per-key concurrency limit
+// ----------------------------------------------------------------------------
+
+// acquireSlot waits for an open in-flight slot on this account, or returns
+// an error if ctx expires first.
+//
+// MoClaw's WS routes events to whichever socket happens to be reading for
+// the account, not to the socket that initiated each request. Two parallel
+// WS connections under the same token end up cross-contaminating responses
+// (we observed this empirically — see ChatCompletionStream comments). The
+// safest workaround is to ensure only one WS request is in flight per
+// account at any time; concurrent callers queue here. Multi-account
+// deployments naturally parallelize because Bifrost rotates across keys.
+func (a *authState) acquireSlot(ctx context.Context) error {
+	select {
+	case a.inFlight <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// releaseSlot frees the in-flight slot. Safe to call multiple times (the
+// non-blocking select drains at most once).
+func (a *authState) releaseSlot() {
+	select {
+	case <-a.inFlight:
+	default:
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Credit accounting
+// ----------------------------------------------------------------------------
+
+const (
+	// creditBalanceTTL is how long we trust a cached balance.
+	creditBalanceTTL = 60 * time.Second
+
+	// creditSafetyThreshold — below this many credits we skip the key.
+	// Picked so a single Opus turn (~3-5 credits typical) still fits.
+	creditSafetyThreshold = 5
+)
+
+// moclawCreditBalanceResp is the /api/credits/balance response shape.
+type moclawCreditBalanceResp struct {
+	TotalBalance int `json:"total_balance"`
+	Wallets      []struct {
+		Balance   int    `json:"balance"`
+		ExpiresAt string `json:"expires_at"`
+	} `json:"wallets"`
+}
+
+// fetchBalance pulls the current credit balance from MoClaw. Uses the
+// supplied access token; does NOT take a.mu (caller must not hold it
+// either, since this does I/O).
+func (a *authState) fetchBalance(accessToken string, apiURL string) (int, time.Time, error) {
+	req := fasthttp.AcquireRequest()
+	defer fasthttp.ReleaseRequest(req)
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseResponse(resp)
+
+	req.SetRequestURI(apiURL + "/api/credits/balance")
+	req.Header.SetMethod(http.MethodGet)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Accept", "application/json")
+
+	if err := a.httpClient.Do(req, resp); err != nil {
+		return 0, time.Time{}, fmt.Errorf("balance fetch: %w", err)
+	}
+	if resp.StatusCode() != fasthttp.StatusOK {
+		return 0, time.Time{}, fmt.Errorf("balance fetch status=%d", resp.StatusCode())
+	}
+	var b moclawCreditBalanceResp
+	if err := sonic.Unmarshal(resp.Body(), &b); err != nil {
+		return 0, time.Time{}, fmt.Errorf("balance decode: %w", err)
+	}
+
+	var resetAt time.Time
+	if len(b.Wallets) > 0 {
+		if t, perr := time.Parse(time.RFC3339, b.Wallets[0].ExpiresAt); perr == nil {
+			resetAt = t
+		}
+	}
+	return b.TotalBalance, resetAt, nil
+}
+
+// ensureCreditsAvailable returns nil if the key is good to use, or a
+// descriptive error if the account is too low or known-exhausted.
+//
+// Caches the balance for creditBalanceTTL to avoid hammering the API.
+// If the cache holds an "exhausted" flag, returns an exhaustion error
+// until creditResetAt passes.
+func (a *authState) ensureCreditsAvailable(accessToken, apiURL string) error {
+	a.creditMu.Lock()
+	if a.creditExhausted && time.Now().Before(a.creditResetAt) {
+		resetAt := a.creditResetAt
+		a.creditMu.Unlock()
+		return fmt.Errorf("moclaw: account credits exhausted until %s", resetAt.Format(time.RFC3339))
+	}
+	cachedFresh := time.Since(a.creditFetchedAt) < creditBalanceTTL && a.creditBalance >= 0
+	cachedBalance := a.creditBalance
+	a.creditMu.Unlock()
+
+	if cachedFresh {
+		if cachedBalance < creditSafetyThreshold {
+			return fmt.Errorf("moclaw: account credits low (%d, threshold %d)", cachedBalance, creditSafetyThreshold)
+		}
+		return nil
+	}
+
+	// Refresh from server.
+	balance, resetAt, err := a.fetchBalance(accessToken, apiURL)
+	if err != nil {
+		// Don't fail the request if balance check itself fails — best effort.
+		if a.logger != nil {
+			a.logger.Warn("moclaw: balance check failed (treating as ok): %v", err)
+		}
+		return nil
+	}
+
+	a.creditMu.Lock()
+	a.creditBalance = balance
+	a.creditFetchedAt = time.Now()
+	if !resetAt.IsZero() {
+		a.creditResetAt = resetAt
+	}
+	a.creditMu.Unlock()
+
+	if balance < creditSafetyThreshold {
+		return fmt.Errorf("moclaw: account credits low (%d, threshold %d)", balance, creditSafetyThreshold)
+	}
+	return nil
+}
+
+// markCreditsExhausted records that the account has run out, so future
+// requests fast-fail (and Bifrost rotates to another key) until reset.
+// Pass the period_end if known so we can clear the flag automatically.
+func (a *authState) markCreditsExhausted(resetAt time.Time) {
+	a.creditMu.Lock()
+	a.creditExhausted = true
+	a.creditBalance = 0
+	a.creditFetchedAt = time.Now()
+	if !resetAt.IsZero() {
+		a.creditResetAt = resetAt
+	}
+	a.creditMu.Unlock()
+	if a.logger != nil {
+		a.logger.Warn("moclaw: credits exhausted on this key; will skip until %s", resetAt.Format(time.RFC3339))
+	}
 }
 
 // isBootstrapped reports whether this thread has already consumed the
@@ -932,6 +1105,43 @@ func (p *MoClawProvider) ChatCompletionStream(ctx *schemas.BifrostContext, postH
 		}
 	}
 
+	// 1b. Credit pre-flight (cached 60s).
+	//
+	// Fast-fail with a retryable status if the key is too low or
+	// known-exhausted; Bifrost's retry logic rotates to another key.
+	apiURLForCredits := p.networkConfig.BaseURL
+	if cerr := auth.ensureCreditsAvailable(accessToken, apiURLForCredits); cerr != nil {
+		statusCode := 402
+		errType := "insufficient_credits"
+		return nil, &schemas.BifrostError{
+			IsBifrostError: false,
+			StatusCode:     &statusCode,
+			Error: &schemas.ErrorField{
+				Message: cerr.Error(),
+				Type:    &errType,
+				Error:   cerr,
+			},
+		}
+	}
+
+	// 1c. Acquire the per-account WS slot — at most ONE WS request
+	// in flight per key. See acquireSlot() comment for the why.
+	if serr := auth.acquireSlot(ctx); serr != nil {
+		statusCode := 503
+		errType := "key_busy"
+		return nil, &schemas.BifrostError{
+			IsBifrostError: false,
+			StatusCode:     &statusCode,
+			Error: &schemas.ErrorField{
+				Message: "moclaw: account busy with another in-flight request",
+				Type:    &errType,
+				Error:   serr,
+			},
+		}
+	}
+	// Slot is released in the stream goroutine's defer (or in early-return
+	// paths below).
+
 	// 2. Resolve session thread ID.
 	apiURL := p.networkConfig.BaseURL
 	threadID, err := auth.getThreadID(accessToken, p.httpClient, apiURL)
@@ -947,6 +1157,7 @@ func (p *MoClawProvider) ChatCompletionStream(ctx *schemas.BifrostContext, postH
 		// Now: return the error. If session resolve is broken, the caller
 		// gets a 502 they can debug, not a misleading greeting.
 		p.logger.Error("moclaw: session resolve failed: %v", err)
+		auth.releaseSlot()
 		statusCode := 502
 		errType := "session_resolve_error"
 		return nil, &schemas.BifrostError{
@@ -973,6 +1184,7 @@ func (p *MoClawProvider) ChatCompletionStream(ctx *schemas.BifrostContext, postH
 		if strings.Contains(dialErr.Error(), "401") {
 			auth.invalidateAccessToken()
 		}
+		auth.releaseSlot()
 		return nil, providerUtils.NewBifrostOperationError("moclaw: ws connect failed", dialErr)
 	}
 
@@ -991,6 +1203,7 @@ func (p *MoClawProvider) ChatCompletionStream(ctx *schemas.BifrostContext, postH
 	_, authMsg, authErr := conn.ReadMessage()
 	if authErr != nil {
 		_ = conn.Close()
+		auth.releaseSlot()
 		if strings.Contains(authErr.Error(), "401") || strings.Contains(authErr.Error(), "unauthorized") {
 			auth.invalidateAccessToken()
 		}
@@ -1001,6 +1214,7 @@ func (p *MoClawProvider) ChatCompletionStream(ctx *schemas.BifrostContext, postH
 		if uerr := sonic.Unmarshal(authMsg, &authRX); uerr == nil {
 			if authRX.Type == "auth_result" && authRX.Success != nil && !*authRX.Success {
 				_ = conn.Close()
+				auth.releaseSlot()
 				auth.invalidateAccessToken()
 				return nil, providerUtils.NewBifrostOperationError("moclaw: ws auth_result success=false", fmt.Errorf("auth rejected by server"))
 			}
@@ -1024,6 +1238,7 @@ func (p *MoClawProvider) ChatCompletionStream(ctx *schemas.BifrostContext, postH
 
 	if err := conn.WriteJSON(frame); err != nil {
 		_ = conn.Close()
+		auth.releaseSlot()
 		return nil, providerUtils.NewBifrostOperationError("moclaw: ws write failed", err)
 	}
 
@@ -1037,6 +1252,9 @@ func (p *MoClawProvider) ChatCompletionStream(ctx *schemas.BifrostContext, postH
 
 	go func() {
 		defer conn.Close()
+		// Release the per-key WS slot so the next request on this account
+		// can proceed. Runs after stream finishes (query_done or error).
+		defer auth.releaseSlot()
 		defer providerUtils.EnsureStreamFinalizerCalled(ctx, postHookSpanFinalizer)
 		defer func() {
 			if ctx.Err() == context.Canceled {
@@ -1103,6 +1321,17 @@ func (p *MoClawProvider) ChatCompletionStream(ctx *schemas.BifrostContext, postH
 				if strings.Contains(err.Error(), "Init failed") {
 					auth.invalidateSession()
 				}
+				// Credit-exhaustion detection: server may close the WS with
+				// a status code or message hinting at insufficient credits.
+				// Best-effort substring match — flag the account exhausted
+				// so subsequent requests fast-fail and Bifrost rotates keys.
+				low := strings.ToLower(err.Error())
+				if strings.Contains(low, "credit") || strings.Contains(low, "insufficient") || strings.Contains(low, "quota") || strings.Contains(low, "402") {
+					// Try to fetch period_end so we know when the key recovers.
+					if balance, resetAt, ferr := auth.fetchBalance(accessToken, p.networkConfig.BaseURL); ferr == nil && balance <= 0 {
+						auth.markCreditsExhausted(resetAt)
+					}
+				}
 				return
 			}
 
@@ -1110,6 +1339,15 @@ func (p *MoClawProvider) ChatCompletionStream(ctx *schemas.BifrostContext, postH
 			if err := sonic.Unmarshal(msgBytes, &rx); err != nil {
 				p.logger.Warn("moclaw: bad ws frame: %v", err)
 				continue
+			}
+
+			// Credit-exhaustion also surfaces as a structured error frame
+			// rather than a connection close. Inspect type/payload defensively.
+			if rx.Type == "error" || strings.Contains(strings.ToLower(string(msgBytes)), "insufficient_credit") {
+				if balance, resetAt, ferr := auth.fetchBalance(accessToken, p.networkConfig.BaseURL); ferr == nil && balance <= 0 {
+					auth.markCreditsExhausted(resetAt)
+				}
+				return
 			}
 
 			// Auth result already handled in ChatCompletionStream pre-send

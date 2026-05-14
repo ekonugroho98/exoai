@@ -176,3 +176,6 @@ ui/app/routeTree.gen.ts
 .next
 
 .infisical
+
+# Personal Camoufox debug scripts
+transports/bifrost-http/handlers/test*.py

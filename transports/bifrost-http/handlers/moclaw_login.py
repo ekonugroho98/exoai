@@ -11,6 +11,7 @@ Stdout protocol:
 """
 import asyncio
 import json
+import os
 import sys
 import urllib.request
 
@@ -19,15 +20,32 @@ PASSWORD = sys.argv[2]
 HEADLESS = sys.argv[3].lower() == "true"
 
 
+# Result tracking — main() wraps do_login() in a retry loop and inspects
+# these flags after each attempt to decide whether to retry, finalize, or
+# bail out. do_login() itself still uses prog/err/done as before; we just
+# layer in the flag-setting wrappers.
+_RESULT_STATE = {"done": False, "last_error": ""}
+
+
 def prog(msg: str):
     print(f"PROGRESS:{msg}", flush=True)
 
 
 def done(tokens_json: str):
+    _RESULT_STATE["done"] = True
     print(f"DONE:{tokens_json}", flush=True)
 
 
 def err(msg: str):
+    # Don't emit ERROR: yet — we may retry. main() prints the final ERROR:
+    # after the last attempt fails, so the parent process only sees ONE
+    # terminal event per invocation.
+    _RESULT_STATE["last_error"] = msg
+    print(f"PROGRESS:attempt failed: {msg}", flush=True)
+
+
+def emit_final_error(msg: str):
+    """Print the terminal ERROR: line after all retries are exhausted."""
     print(f"ERROR:{msg}", flush=True)
 
 
@@ -94,8 +112,14 @@ _CONTINUE_TEXTS = [
 ]
 
 
-async def poll_tokens(page, tries: int = 30) -> str | None:
-    """Poll localStorage every second until tokens appear or tries exhausted."""
+async def poll_tokens(page, tries: int = 90) -> str | None:
+    """Poll localStorage every second until tokens appear or tries exhausted.
+
+    Bumped from 30s to 90s to give Auth0's SPA SDK enough headroom on
+    slow headless launches and constrained networks. Auth0 sometimes
+    re-attempts the silent code-for-token exchange a few times after a
+    Google redirect; 30s wasn't enough on first runs.
+    """
     for _ in range(tries):
         result = await page.evaluate(EXTRACT_JS)
         if result and result != "null":
@@ -109,7 +133,9 @@ async def fill_google_credentials(login_page) -> bool:
     # Email
     prog("Entering Google email...")
     try:
-        await login_page.wait_for_selector('input[type="email"]', timeout=25000)
+        # Bumped from 25s → 45s: Google's first-paint on headless launches
+        # can be slow, especially if Camoufox is fetching fresh fingerprints.
+        await login_page.wait_for_selector('input[type="email"]', timeout=45000)
         await login_page.fill('input[type="email"]', EMAIL)
         await login_page.keyboard.press("Enter")
         # Wait for page to transition to password screen
@@ -419,19 +445,61 @@ async def main() -> None:
     try:
         from camoufox.async_api import AsyncCamoufox  # type: ignore
     except ImportError:
-        err(
+        emit_final_error(
             "camoufox not installed. "
             "Install with: pip install 'camoufox[geoip]' && python -m camoufox fetch"
         )
         return
 
-    prog("Launching Camoufox (anti-detect Firefox)...")
+    # Tunables (env-overridable so callers don't need a redeploy):
+    #   MOCLAW_LOGIN_RETRIES — total attempts per account (default 3)
+    #   MOCLAW_LOGIN_GEOIP   — "1" to keep MaxMind GeoIP lookup (some macOS
+    #                          setups hang on it; we default OFF to be safe).
+    max_attempts = 3
     try:
-        async with AsyncCamoufox(headless=HEADLESS, geoip=True) as browser:
-            page = await browser.new_page()
-            await do_login(page)
-    except Exception as e:
-        err(f"Camoufox error: {e}")
+        if os.environ.get("MOCLAW_LOGIN_RETRIES"):
+            max_attempts = max(1, int(os.environ["MOCLAW_LOGIN_RETRIES"]))
+    except Exception:
+        pass
+
+    geoip_enabled = os.environ.get("MOCLAW_LOGIN_GEOIP") == "1"
+
+    last_error = "unknown"
+    for attempt in range(1, max_attempts + 1):
+        # Reset the result flag so a previous attempt's err()/done() doesn't
+        # falsely satisfy the "succeeded" check below.
+        _RESULT_STATE["done"] = False
+        _RESULT_STATE["last_error"] = ""
+
+        if attempt > 1:
+            # Brief backoff between attempts to let any transient Google /
+            # Auth0 rate-limit cool off. Grows linearly: 3s, 6s, 9s, ...
+            backoff = 3 * (attempt - 1)
+            prog(f"Retry {attempt}/{max_attempts} after {backoff}s...")
+            await asyncio.sleep(backoff)
+        else:
+            prog(f"Attempt {attempt}/{max_attempts}: launching Camoufox (anti-detect Firefox)...")
+
+        try:
+            # Use a FRESH browser/context per attempt so leftover state
+            # (partial OAuth cookies, half-written localStorage, lingering
+            # popups) can't poison the next try.
+            async with AsyncCamoufox(headless=HEADLESS, geoip=geoip_enabled) as browser:
+                page = await browser.new_page()
+                await do_login(page)
+        except Exception as e:
+            _RESULT_STATE["last_error"] = f"Camoufox error: {e}"
+            prog(f"PROGRESS:attempt {attempt} crashed: {e}")
+
+        if _RESULT_STATE["done"]:
+            return  # done() already printed DONE: line — we're finished
+
+        last_error = _RESULT_STATE["last_error"] or "no tokens"
+        if attempt < max_attempts:
+            prog(f"Attempt {attempt} failed ({last_error}); closing browser and retrying...")
+
+    # All attempts exhausted — emit the final terminal error.
+    emit_final_error(f"All {max_attempts} attempts failed. Last error: {last_error}")
 
 
 asyncio.run(main())
